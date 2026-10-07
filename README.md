@@ -1,4 +1,4 @@
-# SegFormer baseline for 4-channel semantic segmentation
+# SegFormer baseline for GF false-color semantic segmentation
 
 This repository contains a reproducible binary-segmentation baseline for the paired four-band TIFF dataset in `dataset/`. The loader selects GF's NIR, red, and green bands in that order to make a three-channel false-color input; `train.py` and `evaluate.py` provide the training and held-out test entry points.
 

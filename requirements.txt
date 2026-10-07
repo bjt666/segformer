@@ -3,5 +3,4 @@
 transformers==4.44.2
 tifffile==2024.9.20
 numpy==1.26.4
-PyYAML==6.0.2
 tqdm==4.66.5

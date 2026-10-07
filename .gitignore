@@ -1,0 +1,22 @@
+# Local datasets and experiment outputs
+dataset/
+data/
+outputs/
+runs/
+checkpoints/
+*.pth
+*.pt
+*.ckpt
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# IDE and OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

@@ -1,0 +1,7 @@
+# Install a CUDA-enabled PyTorch build separately, following the official
+# PyTorch selector for the server's driver/CUDA runtime.
+transformers==4.44.2
+tifffile==2024.9.20
+numpy==1.26.4
+PyYAML==6.0.2
+tqdm==4.66.5

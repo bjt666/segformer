@@ -21,6 +21,11 @@ from transformers import (
     SegformerForSemanticSegmentation,
 )
 
+# TIFFs store the GF multispectral bands as B, G, R, NIR. Use a vegetation
+# false-color input with the displayed channels [NIR, R, G].
+INPUT_CHANNELS = (3, 2, 1)
+INPUT_BANDS = ("NIR", "R", "G")
+
 
 class PairedTiffDataset(Dataset):
     """Loads images/<split> and masks/<split>, matching files by name."""
@@ -57,6 +62,7 @@ class PairedTiffDataset(Dataset):
         if mask.ndim != 2 or mask.shape != image.shape[:2]:
             raise ValueError(f"Expected matching HxW mask, got {mask.shape}: {name}")
 
+        image = image[..., INPUT_CHANNELS]
         image = (image - self.mean) / self.std
         # Dataset labels are 0 (background) and 255 (foreground).
         mask = (mask > 0).astype(np.int64)
@@ -92,18 +98,18 @@ def compute_train_stats(root: Path) -> tuple[np.ndarray, np.ndarray]:
         count += image.shape[0] * image.shape[1]
     mean = total / count
     std = np.sqrt(np.maximum(total_sq / count - np.square(mean), 1e-12))
-    return mean.astype(np.float32), std.astype(np.float32)
+    return mean[list(INPUT_CHANNELS)].astype(np.float32), std[list(INPUT_CHANNELS)].astype(np.float32)
 
 
 def build_model(pretrained: bool, checkpoint: str, num_labels: int = 2) -> SegformerForSemanticSegmentation:
-    """Create a 4-channel SegFormer and optionally load an ImageNet encoder."""
+    """Create a 3-channel NIR-R-G SegFormer and optionally load an ImageNet encoder."""
     if not pretrained:
-        config = SegformerConfig(num_channels=4, num_labels=num_labels)
+        config = SegformerConfig(num_channels=3, num_labels=num_labels)
         return SegformerForSemanticSegmentation(config)
 
     source = SegformerForImageClassification.from_pretrained(checkpoint)
     config = SegformerConfig.from_pretrained(checkpoint)
-    config.num_channels = 4
+    config.num_channels = 3
     config.num_labels = num_labels
     config.id2label = {0: "background", 1: "target"}
     config.label2id = {"background": 0, "target": 1}
@@ -117,24 +123,21 @@ def build_model(pretrained: bool, checkpoint: str, num_labels: int = 2) -> Segfo
         if key not in target_state:
             continue
         target = target_state[key]
-        if value.shape == target.shape:
-            target.copy_(value)
-            copied += 1
-        elif (key.endswith("patch_embeddings.0.proj.weight") and value.ndim == 4
-              and value.shape[1] == 3 and target.shape[1] == 4):
-            # GF multispectral order is B, G, R, NIR. The ImageNet checkpoint
-            # expects R, G, B, so map the visible filters by wavelength and
-            # initialize the NIR filter from the mean visible filter.
-            bgr_weights = value[:, [2, 1, 0], :, :]
-            nir_weight = value.mean(dim=1, keepdim=True)
-            target.copy_(torch.cat((bgr_weights, nir_weight), dim=1) * 0.75)
+        if key.endswith("patch_embeddings.0.proj.weight") and value.ndim == 4 \
+                and value.shape[1] == 3 and target.shape[1] == 3:
+            # Input order is NIR, R, G. Initialize NIR with the mean RGB filter,
+            # then map red and green to their corresponding ImageNet filters.
+            target.copy_(torch.stack((value.mean(dim=1), value[:, 0], value[:, 1]), dim=1))
             copied += 1
             adapted_input = True
+        elif value.shape == target.shape:
+            target.copy_(value)
+            copied += 1
     if not adapted_input:
         raise RuntimeError("Could not find/adapt the first 3-to-4-channel patch projection")
     model.load_state_dict(target_state)
     print(f"Loaded {copied} matching ImageNet encoder tensors from {checkpoint}; "
-          "the BGRN input projection was adapted and the segmentation head is newly initialized.")
+          "the NIR-R-G input projection was adapted and the segmentation head is newly initialized.")
     return model
 
 
@@ -225,6 +228,7 @@ def main() -> None:
     run_config["output_dir"] = str(args.output_dir.resolve())
     run_config["normalization_mean"] = mean.tolist()
     run_config["normalization_std"] = std.tolist()
+    run_config["input_bands"] = list(INPUT_BANDS)
     (args.output_dir / "run_config.json").write_text(
         json.dumps(run_config, indent=2), encoding="utf-8"
     )

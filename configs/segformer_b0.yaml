@@ -1,0 +1,18 @@
+# TIFF source order: Blue, Green, Red, NIR (zero-based indices below).
+data_root: dataset
+output_dir: null  # A timestamped experiment directory is created automatically.
+epochs: 100
+batch_size: 8
+num_workers: 4
+seed: 42
+device: cuda
+pretrained: true
+pretrained_model: nvidia/mit-b0
+input_channels: [3, 2, 1]
+input_bands: [NIR, R, G]
+encoder_lr: 0.00006
+decoder_lr: 0.0006
+weight_decay: 0.01
+loss: cross_entropy
+log_every: 20
+visualization_samples: 8

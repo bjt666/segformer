@@ -38,7 +38,16 @@ def load_checkpoint(path: str | Path) -> dict:
 
 def preprocessing_from_checkpoint(checkpoint: dict) -> tuple[tuple[int, ...], np.ndarray, np.ndarray]:
     config = checkpoint.get("config", {})
-    channels = tuple(config.get("input_channels", [3, 2, 1]))
+    if "input_channels" in config:
+        channels = tuple(config["input_channels"])
+    else:
+        num_channels = checkpoint["model_config"].get("num_channels", 3)
+        if num_channels == 3:
+            channels = (3, 2, 1)
+        elif num_channels == 4:
+            channels = (0, 1, 2, 3)
+        else:
+            raise ValueError("Legacy checkpoint input order is unknown; explicit input_channels are required.")
     mean = np.asarray(checkpoint["normalization_mean"], dtype=np.float32)
     std = np.asarray(checkpoint["normalization_std"], dtype=np.float32)
     if len(channels) != checkpoint["model_config"].get("num_channels", 3):
@@ -48,6 +57,21 @@ def preprocessing_from_checkpoint(checkpoint: dict) -> tuple[tuple[int, ...], np
     if not np.isfinite(mean).all() or not np.isfinite(std).all() or (std <= 0).any():
         raise ValueError("Checkpoint normalization statistics are invalid.")
     return channels, mean, std
+
+
+def input_bands_from_checkpoint(checkpoint: dict) -> list[str]:
+    channels, _, _ = preprocessing_from_checkpoint(checkpoint)
+    bands = checkpoint.get("config", {}).get("input_bands")
+    if bands is None:
+        source_bands = ("B", "G", "R", "NIR")
+        if any(type(channel) is not int or channel not in range(4) for channel in channels):
+            raise ValueError("Checkpoint contains unknown source band indices.")
+        return [source_bands[channel] for channel in channels]
+    if not isinstance(bands, list) or len(bands) != len(channels) or any(
+        not isinstance(band, str) or not band for band in bands
+    ):
+        raise ValueError("Checkpoint input_bands do not describe all selected channels.")
+    return bands.copy()
 
 
 def capture_rng(generators: dict[str, torch.Generator]) -> dict:
@@ -76,9 +100,12 @@ def make_checkpoint(model, optimizer, scheduler, epoch: int, best_iou: float,
                     best_epoch: int, config: dict, mean: np.ndarray, std: np.ndarray,
                     history: list[dict], manifest: dict, generators: dict,
                     environment: dict) -> dict:
+    from .model import model_architecture
+
     return {
         "schema_version": SCHEMA_VERSION, "model": model.state_dict(),
-        "model_config": model.config.to_dict(), "optimizer": optimizer.state_dict(),
+        "model_config": model.config.to_dict(), "architecture": model_architecture(model),
+        "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(), "epoch": epoch,
         "best_iou": best_iou, "best_epoch": best_epoch, "config": config,
         "normalization_mean": mean.tolist(), "normalization_std": std.tolist(),

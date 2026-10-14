@@ -1,0 +1,26 @@
+# Three independent 3x3 candidates with deep-shallow gates: full-model scale control.
+data_root: dataset
+output_dir: null
+epochs: 100
+batch_size: 8
+num_workers: 4
+seed: 42
+device: cuda
+pretrained: true
+pretrained_model: nvidia/mit-b0
+input_channels: [3, 2, 1]
+input_bands: [NIR, R, G]
+encoder_lr: 0.00006
+decoder_lr: 0.0006
+weight_decay: 0.01
+loss: cross_entropy
+log_every: 20
+visualization_samples: 8
+module_a: true
+module_b: true
+local_kernels: [3, 3, 3]
+refinement_stages: [1, 2]
+gate_mode: deep_shallow
+gate_reduction: 4
+gate_init_probability: 0.3333333333333333
+residual_init_std: 0.001

@@ -20,7 +20,10 @@ from segformer_baseline.checkpoint import (
 from segformer_baseline.config import DEFAULTS, default_config, read_config, save_config, validate_config
 from segformer_baseline.dataset import PairedTiffDataset, build_manifest, compute_train_stats
 from segformer_baseline.engine import evaluate_model, train_epoch
-from segformer_baseline.model import build_model, model_from_checkpoint
+from segformer_baseline.model import (
+    architecture_from_config, build_model, checkpoint_architecture,
+    checkpoint_model_signature, model_architecture, model_from_checkpoint, model_parameter_counts,
+)
 from segformer_baseline.utils import (
     collect_environment, resolve_device, save_pip_freeze, seed_worker, set_seed,
     setup_logger, utc_now, write_history, write_json,
@@ -58,7 +61,11 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
                 "This checkpoint lacks full training state. Old best.pt files support evaluation/prediction, "
                 "but cannot resume training. Use a new-format checkpoints/last.pt."
             )
-        config = checkpoint["config"].copy()
+        # Old schema-2 runs lack the new optional architecture switches.
+        config = default_config()
+        config.update(checkpoint["config"])
+        if architecture_from_config(config) != checkpoint_architecture(checkpoint):
+            raise ValueError("Saved training settings do not match the checkpoint architecture.")
         if args.resume.parent.name == "checkpoints":
             # The full run directory can be moved to another server without retaining old absolute paths.
             config["output_dir"] = str(args.resume.resolve().parent.parent)
@@ -76,7 +83,10 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
     validate_config(config)
     if config["output_dir"] is None:
         stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-        config["output_dir"] = f"outputs/segformer-b0-seed{config['seed']}-{stamp}"
+        variant = "baseline"
+        if config["module_a"]:
+            variant = "a" if not config["module_b"] else f"ab-{config['gate_mode']}"
+        config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())
     return config
@@ -125,6 +135,15 @@ def main() -> None:
     train_loader = DataLoader(train_set, shuffle=True, generator=generators["train"], **common)
     val_loader = DataLoader(val_set, shuffle=False, generator=generators["val"], **common)
     model = (model_from_checkpoint(checkpoint) if checkpoint else build_model(config)).to(device)
+    architecture = model_architecture(model)
+    parameter_counts = model_parameter_counts(model)
+    logger.info("Architecture: %s", architecture)
+    logger.info("Model parameters: %s", parameter_counts)
+    write_json(output / "architecture.json", architecture)
+    write_json(output / "model_summary.json", {"architecture": architecture,
+               "hidden_sizes": list(model.config.hidden_sizes),
+               "decoder_hidden_size": model.config.decoder_hidden_size,
+               "parameter_counts": parameter_counts})
     optimizer = torch.optim.AdamW([
         {"params": model.segformer.parameters(), "lr": config["encoder_lr"]},
         {"params": model.decode_head.parameters(), "lr": config["decoder_lr"]},
@@ -169,7 +188,12 @@ def main() -> None:
             best_payload = load_checkpoint(original_best)
             if (best_payload.get("epoch") != best_epoch
                     or best_payload.get("best_iou") != best_iou
-                    or best_payload.get("dataset_fingerprint") != manifest["fingerprint"]):
+                    or best_payload.get("dataset_fingerprint") != manifest["fingerprint"]
+                    or checkpoint_architecture(best_payload) != architecture
+                    or checkpoint_model_signature(best_payload) != checkpoint_model_signature(checkpoint)
+                    or preprocessing_from_checkpoint(best_payload)[0] != channels
+                    or best_payload["normalization_mean"] != checkpoint["normalization_mean"]
+                    or best_payload["normalization_std"] != checkpoint["normalization_std"]):
                 raise ValueError("The original best.pt does not match the resumed run.")
             if output != source_output:
                 atomic_torch_save(best_payload, checkpoints / "best.pt")

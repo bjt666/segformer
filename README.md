@@ -1,6 +1,6 @@
-# GF 假彩色输入的 SegFormer 基线
+# GF 假彩色输入的 SegFormer 基线与结构消融
 
-用于四波段 TIFF 的二分类语义分割，包含训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。
+用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。
 
 ## 基线设置
 
@@ -15,14 +15,61 @@
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
 
+## A/B 结构与配置开关
+
+默认配置 `configs/segformer_b0.yaml` 中两个模块均关闭，使用原版 SegFormer。新增处理发生在编码器输出与原版 MLP 解码器之间，编码器结构和原版解码器计算保留：
+
+- **A：多感受野局部补充。** 默认分别处理 F1、F2。每个局部分支采用深度卷积、GELU 和逐点卷积，生成新增信息；A-only 将分支结果取平均后加回原特征。
+- **B：深浅联合门控。** 由原浅层特征、A 的局部候选和对齐后的 F3/F4 上下文生成每个分支的空间 sigmoid 权重，再将加权补充加回原特征。门控只作用于新增信息，不直接过滤原浅层路径。各分支权重独立，不使用必须总和为 1 的 softmax，因此可同时减小。
+- **浅层门控对照。** `gate_mode: shallow` 取消门控生成中的 F3/F4 上下文；最终原版解码器仍使用 F3、F4，避免把移除深层特征误当成取消引导。
+
+B 用于选择 A 的候选信息，因此不提供 B 开启而 A 关闭的版本。局部增强和门控是否改善识别、是否减少误检，均由实验检验，不预设结果。
+
+所有结构设置在 YAML 中配置：
+
+| 字段 | 默认值 | 含义 |
+| --- | --- | --- |
+| `module_a` | `false` | 开启局部残差分支；关闭时使用原版模型 |
+| `module_b` | `false` | 开启分支门控，要求 A 已开启 |
+| `local_kernels` | `[3, 5, 7]` | 局部分支卷积核；奇数 3–31，可重复 |
+| `refinement_stages` | `[1, 2]` | 处理 F1/F2，编号从 1 开始；可选 `[1]` 或 `[2]` |
+| `gate_mode` | `deep_shallow` | 深浅联合门控；`shallow` 为浅层门控对照，仅 B 开启时使用 |
+| `gate_reduction` | `4` | 门控中间通道约为当前浅层通道的 1/4，最少 1 通道 |
+| `gate_init_probability` | `0.3333333333333333` | 各 sigmoid 门控的初始值，必须严格介于 0 和 1 之间 |
+| `residual_init_std` | `0.001` | 局部分支末尾逐点卷积权重的初始化标准差 |
+
+默认三个分支的门控初值为 1/3，与 A-only 的平均权重一致；局部分支以小幅残差开始。配置值不会按分支数量静默改写。修改分支数量且启用 B 时，需明确选择门控初值：两条及以上分支可用 `1/分支数`；单分支不能设为 1，可设合法值如 0.5，并记录初始增强幅度的差异。多种配置之间不保证全部随机初始化参数逐位相同。
+
+提供以下完整配置，训练设置均为 NIR/R/G、ImageNet 编码器预训练、不加权交叉熵和 100 轮：
+
+| 配置文件 | A | B | 用途 |
+| --- | --- | --- | --- |
+| `segformer_b0.yaml` | 关闭 | 关闭 | 原版基线 |
+| `segformer_b0_a.yaml` | 开启 | 关闭 | 多感受野、固定平均融合 |
+| `segformer_b0_ab.yaml` | 开启 | 深浅联合 | 完整候选结构 |
+| `segformer_b0_a_shallow_gate.yaml` | 开启 | 浅层门控 | 检验深层引导的作用 |
+| `segformer_b0_single_scale.yaml` | `[3, 3, 3]` | 关闭 | A 的单感受野对照，保留三个独立分支 |
+| `segformer_b0_ab_single_scale.yaml` | `[3, 3, 3]` | 深浅联合 | 完整结构中的单感受野对照 |
+
+单感受野配置保留三个独立分支及 1/3 的门控初值，其深度卷积参数量仍与 `[3, 5, 7]` 不完全一致，需要记录实际模型规模。`[3]` 可作为更少参数的工程选择，但不能用来排除参数量影响；若同时启用 B，其门控初值必须小于 1，例如 0.5。
+
+结构配置随检查点保存；续训、评估和预测按检查点重建结构，不需要另传 A/B 配置。更改结构应开启新的独立训练，不能将基线的训练后权重当作改进版本的续训起点来与独立训练基线比较。
+
 ## 目录结构
 
 ```text
-configs/segformer_b0.yaml
+configs/
+  segformer_b0.yaml
+  segformer_b0_a.yaml
+  segformer_b0_ab.yaml
+  segformer_b0_a_shallow_gate.yaml
+  segformer_b0_single_scale.yaml
+  segformer_b0_ab_single_scale.yaml
 segformer_baseline/
   config.py          配置读取和校验
   dataset.py         TIFF 读取、增强、归一化、数据指纹
   model.py           模型构建和预训练适配
+  refinement.py      A 局部补充、B 分支门控和原版解码器包装
   engine.py          训练与评估循环
   metrics.py         二分类指标
   checkpoint.py      检查点和随机状态恢复
@@ -45,6 +92,8 @@ dataset/
 ```
 
 当前数据是 `256×256×4` HWC 图像、`256×256` 掩膜，训练/验证/测试分别为 700/87/89 对。支持 `.tif`、`.tiff`；图像需有限数值；掩膜接受 0、1、255（1/255 都视为目标）。其他标签值会报错。训练/评估批次内的空间尺寸需一致。
+
+当前切片来自同一张原始大图，缺少原图位置记录；现有划分尚未证实空间独立，跨划分重叠和空间相关性也未完全排除。首轮保留现有 dataset，不删除其中的全零背景切片，各版本使用同一划分。结果应限定为当前单场景切片划分下的比较，不能直接解释为跨日期或跨海域泛化；后续若获得独立场景，可增加外部评估。
 
 GF 的 B-G-R-NIR 存储顺序来自数据描述，元数据没有波段名称；需要保证实际导出没有重新排列波段。
 
@@ -114,6 +163,30 @@ tail -f outputs/segformer-b0-seed42-run1/console.log
 
 从头随机初始化的独立实验用 `--no-pretrained`，输出到新目录。
 
+### 首轮 GF 16 m 结构实验
+
+先按顺序独立训练 **Baseline → A 固定融合 → A+B 深浅联合门控**。不要使用 `--resume` 从前一版本启动后一版本。以下实验目录仅为示例，已存在时请换新名称：
+
+```bash
+python train.py --config configs/segformer_b0.yaml --output-dir outputs/gf16m-b0-baseline-seed42
+python train.py --config configs/segformer_b0_a.yaml --output-dir outputs/gf16m-b0-a-seed42
+python train.py --config configs/segformer_b0_ab.yaml --output-dir outputs/gf16m-b0-ab-seed42
+```
+
+先比较三个版本的验证集最佳前景 IoU、F1、Precision、Recall 和固定样本预测图，检查新增分支是否有收益、门控是否改变误检与漏检。数据划分、输入、预训练来源、损失、训练轮次与 batch size 保持一致。按验证集结果选择结构，不使用测试集反复调参。
+
+有初步收益后，再运行浅层门控和单感受野对照：
+
+```bash
+python train.py --config configs/segformer_b0_a_shallow_gate.yaml --output-dir outputs/gf16m-b0-shallow-gate-seed42
+python train.py --config configs/segformer_b0_single_scale.yaml --output-dir outputs/gf16m-b0-single-scale-seed42
+python train.py --config configs/segformer_b0_ab_single_scale.yaml --output-dir outputs/gf16m-b0-ab-single-scale-seed42
+```
+
+最终对主要版本至少运行三个相同的 seed 集合，例如 42、43、44，分别使用新输出目录并报告均值与标准差。每组仍独立加载 ImageNet 编码器，解码器和新增模块随机初始化。模型规模和运行开销应一并比较；一次 seed 的提升不足以确认稳定收益。
+
+确定结构后，使用各版本验证集选出的 `best.pt` 做测试评估和相同测试样本的预测，命令与下文一致，只需替换检查点路径。旧基线检查点继续用于原版模型的评估/预测，旧完整训练状态继续按原结构恢复。
+
 ### 训练产物
 
 ```text
@@ -121,6 +194,8 @@ outputs/实验名称/
   config.yaml                  实际训练配置
   run_config.json              同一配置的 JSON 版本
   preprocessing.json           输入波段和训练集归一化统计
+  architecture.json            A/B 开关、局部分支与门控结构设置
+  model_summary.json           模型参数量及模型结构记录
   environment.json             原始环境、GPU、Git 提交号和工作区状态
   sessions.json                每次启动/恢复的环境和参数
   requirements-lock.txt        初次运行的 pip freeze
@@ -157,7 +232,7 @@ python train.py --resume outputs/segformer-b0-seed42-run1/checkpoints/last.pt
 - 可更改 `--data-root`、`--output-dir`、`--device`、`--num-workers` 和日志/预览数量。更改 workers、硬件或软件可能改变数值结果；随机状态恢复不保证跨环境逐位一致。
 - 迁移服务器时复制**完整实验目录**，保留 `last.pt` 和 `best.pt`。指纹与绝对数据路径无关，目录移动后可以恢复。
 - 第一轮尚未完成时还没有检查点。当前不支持在一轮中途精确恢复 batch 位置。
-- 旧简版的三通道 `best.pt` 可评估/预测；它没有优化器状态，不能完整续训。
+- 旧简版的三/四通道 `best.pt` 可评估/预测；缺少通道字段时按已知旧版的输入顺序恢复。它没有优化器状态，不能完整续训。
 
 恢复到新目录的例子：
 

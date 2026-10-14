@@ -16,3 +16,14 @@ weight_decay: 0.01
 loss: cross_entropy
 log_every: 20
 visualization_samples: 8
+
+# A: local residual branches. B: independent spatial gates for A's branches.
+# Both false retain the original SegFormer-B0 architecture.
+module_a: false
+module_b: false
+local_kernels: [3, 5, 7]
+refinement_stages: [1, 2]  # F1 and F2; stage numbers are one-based.
+gate_mode: deep_shallow  # Used only when module_b is true.
+gate_reduction: 4
+gate_init_probability: 0.3333333333333333
+residual_init_std: 0.001

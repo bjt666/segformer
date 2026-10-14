@@ -10,11 +10,11 @@ from pathlib import Path
 from torch import nn
 from torch.utils.data import DataLoader
 
-from segformer_baseline.checkpoint import load_checkpoint, preprocessing_from_checkpoint
+from segformer_baseline.checkpoint import input_bands_from_checkpoint, load_checkpoint, preprocessing_from_checkpoint
 from segformer_baseline.dataset import PairedTiffDataset, build_manifest, file_sha256
 from segformer_baseline.engine import evaluate_model
 from segformer_baseline.metrics import METRIC_POLICY
-from segformer_baseline.model import model_from_checkpoint
+from segformer_baseline.model import model_architecture, model_from_checkpoint, model_parameter_counts
 from segformer_baseline.utils import collect_environment, resolve_device, setup_logger, write_csv, write_json
 from segformer_baseline.visualization import plot_confusion, save_prediction_visuals
 
@@ -52,7 +52,8 @@ def main() -> None:
     report = {"split": args.split, "num_images": result["num_images"],
               "checkpoint": str(args.checkpoint.resolve()), "checkpoint_sha256": file_sha256(args.checkpoint),
               "checkpoint_epoch": checkpoint.get("epoch"), "input_channels": list(channels),
-              "input_bands": checkpoint.get("config", {}).get("input_bands", ["NIR", "R", "G"]),
+              "input_bands": input_bands_from_checkpoint(checkpoint),
+              "architecture": model_architecture(model), "parameter_counts": model_parameter_counts(model),
               "loss": result["loss"], **result["metrics"],
               "confusion_matrix": result["confusion"].tolist(), "metric_policy": METRIC_POLICY}
     write_json(output / "metrics.json", report)

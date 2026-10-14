@@ -12,11 +12,11 @@ import tifffile
 import torch
 from tqdm import tqdm
 
-from segformer_baseline.checkpoint import load_checkpoint, preprocessing_from_checkpoint
+from segformer_baseline.checkpoint import input_bands_from_checkpoint, load_checkpoint, preprocessing_from_checkpoint
 from segformer_baseline.dataset import file_sha256, image_files, normalize_image, read_image, read_mask
 from segformer_baseline.engine import resized_logits
 from segformer_baseline.metrics import METRIC_POLICY, confusion_matrix, metrics_from_confusion
-from segformer_baseline.model import model_from_checkpoint
+from segformer_baseline.model import model_architecture, model_from_checkpoint, model_parameter_counts
 from segformer_baseline.utils import collect_environment, resolve_device, setup_logger, write_csv, write_json
 from segformer_baseline.visualization import save_prediction_visuals
 
@@ -82,7 +82,8 @@ def main() -> None:
     report = {"num_images": len(paths), "checkpoint": str(args.checkpoint.resolve()),
               "checkpoint_sha256": file_sha256(args.checkpoint), "checkpoint_epoch": checkpoint.get("epoch"),
               "input": str(args.input.resolve()), "input_channels": list(channels),
-              "input_bands": checkpoint.get("config", {}).get("input_bands", ["NIR", "R", "G"]),
+              "input_bands": input_bands_from_checkpoint(checkpoint),
+              "architecture": model_architecture(model), "parameter_counts": model_parameter_counts(model),
               "mask_encoding": {"background": 0, "target": 255}, "probabilities_saved": args.save_probabilities,
               "display": "NIR,R,G with per-image per-channel 2nd/98th percentile stretch; display only",
               "georeferencing": "Pixel dimensions are preserved; GeoTIFF spatial metadata is not copied.",

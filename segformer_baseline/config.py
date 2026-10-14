@@ -17,6 +17,10 @@ DEFAULTS: dict[str, Any] = {
     "input_channels": [3, 2, 1], "input_bands": ["NIR", "R", "G"],
     "encoder_lr": 6e-5, "decoder_lr": 6e-4, "weight_decay": 0.01,
     "loss": "cross_entropy", "log_every": 20, "visualization_samples": 8,
+    "module_a": False, "module_b": False,
+    "local_kernels": [3, 5, 7], "refinement_stages": [1, 2],
+    "gate_mode": "deep_shallow", "gate_reduction": 4,
+    "gate_init_probability": 1 / 3, "residual_init_std": 0.001,
 }
 
 
@@ -51,6 +55,32 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("weight_decay must be nonnegative.")
     if type(config["pretrained"]) is not bool:
         raise ValueError("pretrained must be true or false.")
+    for key in ("module_a", "module_b"):
+        if type(config[key]) is not bool:
+            raise ValueError(f"{key} must be true or false.")
+    if config["module_b"] and not config["module_a"]:
+        raise ValueError("module_b selects module_a branches and requires module_a: true.")
+    kernels = config["local_kernels"]
+    if not isinstance(kernels, list) or not kernels or any(
+        type(kernel) is not int or not 3 <= kernel <= 31 or kernel % 2 != 1
+        for kernel in kernels
+    ):
+        raise ValueError("local_kernels must be a nonempty list of odd integers from 3 to 31.")
+    stages = config["refinement_stages"]
+    if not isinstance(stages, list) or not stages or any(
+        type(stage) is not int or stage not in (1, 2) for stage in stages
+    ) or len(set(stages)) != len(stages):
+        raise ValueError("refinement_stages must contain unique stage numbers from 1 and 2.")
+    if config["gate_mode"] not in ("shallow", "deep_shallow"):
+        raise ValueError("gate_mode must be shallow or deep_shallow.")
+    if type(config["gate_reduction"]) is not int or config["gate_reduction"] < 1:
+        raise ValueError("gate_reduction must be a positive integer.")
+    probability = config["gate_init_probability"]
+    if type(probability) not in (int, float) or not math.isfinite(probability) or not 0 < probability < 1:
+        raise ValueError("gate_init_probability must be finite and strictly between 0 and 1.")
+    initial_std = config["residual_init_std"]
+    if type(initial_std) not in (int, float) or not math.isfinite(initial_std) or initial_std < 0:
+        raise ValueError("residual_init_std must be finite and nonnegative.")
     for key in ("data_root", "device", "pretrained_model"):
         if not isinstance(config[key], str) or not config[key]:
             raise ValueError(f"{key} must be a nonempty string.")

@@ -9,12 +9,14 @@ import torch
 from transformers import SegformerConfig, SegformerForImageClassification, SegformerForSemanticSegmentation
 
 from .config import DEFAULTS, default_config, validate_config
+from .decoder import DecoderHead, DecoderSegformerForSemanticSegmentation
 from .refinement import RefinedDecodeHead
 
 
 ARCHITECTURE_FIELDS = (
     "module_a", "module_b", "local_kernels", "refinement_stages", "gate_mode",
     "gate_reduction", "gate_init_probability", "residual_init_std",
+    "decoder_fusion", "decoder_upsampling", "upsample_channels",
 )
 
 
@@ -69,21 +71,41 @@ def model_parameter_counts(model) -> dict:
     count = lambda module: sum(parameter.numel() for parameter in module.parameters())
     encoder = count(model.segformer)
     decoder = count(model.decode_head)
-    original_head = (model.decode_head.original_head if isinstance(model.decode_head, RefinedDecodeHead)
-                     else model.decode_head)
-    original_decoder = count(original_head)
+    if isinstance(model.decode_head, RefinedDecodeHead):
+        original_decoder = count(model.decode_head.original_head)
+        refinement, redesign = decoder - original_decoder, 0
+    elif isinstance(model.decode_head, DecoderHead):
+        # This is a replacement head, including any reused projection modules.
+        original_decoder, refinement, redesign = 0, 0, decoder
+    else:
+        original_decoder, refinement, redesign = decoder, 0, 0
     return {"total": count(model), "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
             "encoder": encoder, "decoder": decoder, "original_decoder": original_decoder,
-            "refinement": decoder - original_decoder}
+            "refinement": refinement, "decoder_redesign": redesign}
 
 
-def _attach_refinement(model, architecture: dict) -> None:
+def _uses_decoder_redesign(architecture: dict) -> bool:
+    return architecture["decoder_fusion"] != "mlp" or architecture["decoder_upsampling"] != "bilinear"
+
+
+def _attach_architecture(model, architecture: dict) -> None:
+    # Retain the schema-2 metadata key so old A/B checkpoints remain readable.
+    # It now describes all optional decoder and refinement switches.
     model.config.local_refinement = copy.deepcopy(architecture)
-    if architecture["module_a"]:
+    if _uses_decoder_redesign(architecture):
+        with torch.random.fork_rng(devices=[]):
+            model.decode_head = DecoderHead(model.decode_head, model.config, architecture)
+    elif architecture["module_a"]:
         # Only new CPU modules consume this forked RNG. The original encoder/head
         # initialization and the outer CPU/CUDA training RNG are retained.
         with torch.random.fork_rng(devices=[]):
             model.decode_head = RefinedDecodeHead(model.decode_head, model.config, architecture)
+
+
+def _new_model(model_config: SegformerConfig, architecture: dict) -> SegformerForSemanticSegmentation:
+    model_class = (DecoderSegformerForSemanticSegmentation if _uses_decoder_redesign(architecture)
+                   else SegformerForSemanticSegmentation)
+    return model_class(model_config)
 
 
 def build_model(config: dict) -> SegformerForSemanticSegmentation:
@@ -100,9 +122,10 @@ def build_model(config: dict) -> SegformerForSemanticSegmentation:
     model_config.id2label = {0: "background", 1: "target"}
     model_config.label2id = {"background": 0, "target": 1}
     model_config.architectures = ["SegformerForSemanticSegmentation"]
-    model = SegformerForSemanticSegmentation(model_config)
+    model = _new_model(model_config, architecture)
+    model.config.architectures = [type(model).__name__]
     if source is None:
-        _attach_refinement(model, architecture)
+        _attach_architecture(model, architecture)
         return model
 
     source_state, target_state = source.state_dict(), model.state_dict()
@@ -125,17 +148,18 @@ def build_model(config: dict) -> SegformerForSemanticSegmentation:
     if missing:
         raise ValueError(f"Incomplete pretrained encoder: {sorted(missing)[:5]}")
     model.load_state_dict(target_state)
-    _attach_refinement(model, architecture)
+    _attach_architecture(model, architecture)
     logging.getLogger("segformer").info(
-        "Loaded %s encoder tensors from %s; input=%s; original MLP decoder initialized randomly.",
+        "Loaded %s encoder tensors from %s; input=%s; decoder=%s/%s initialized randomly.",
         len(copied), config["pretrained_model"], config["input_bands"],
+        architecture["decoder_fusion"], architecture["decoder_upsampling"],
     )
     return model
 
 
 def model_from_checkpoint(checkpoint: dict) -> SegformerForSemanticSegmentation:
     architecture = checkpoint_architecture(checkpoint)
-    model = SegformerForSemanticSegmentation(SegformerConfig.from_dict(checkpoint["model_config"]))
-    _attach_refinement(model, architecture)
+    model = _new_model(SegformerConfig.from_dict(checkpoint["model_config"]), architecture)
+    _attach_architecture(model, architecture)
     model.load_state_dict(checkpoint["model"])
     return model

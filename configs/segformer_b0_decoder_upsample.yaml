@@ -1,0 +1,33 @@
+# TIFF source order: Blue, Green, Red, NIR (zero-based indices below).
+data_root: dataset
+output_dir: null  # A timestamped experiment directory is created automatically.
+epochs: 100
+batch_size: 8
+num_workers: 4
+seed: 42
+device: cuda
+pretrained: true
+pretrained_model: nvidia/mit-b0
+input_channels: [3, 2, 1]
+input_bands: [NIR, R, G]
+encoder_lr: 0.00006
+decoder_lr: 0.0006
+weight_decay: 0.01
+loss: cross_entropy
+log_every: 20
+visualization_samples: 8
+
+# Keep the earlier A/B refinement modules disabled for this decoder experiment.
+module_a: false
+module_b: false
+local_kernels: [3, 5, 7]
+refinement_stages: [1, 2]  # Legacy defaults; inactive while module_a is false.
+gate_mode: deep_shallow
+gate_reduction: 4
+gate_init_probability: 0.3333333333333333
+residual_init_std: 0.001
+
+# Preserve the original parallel MLP fusion; learn feature refinement while resizing.
+decoder_fusion: mlp
+decoder_upsampling: learned
+upsample_channels: [64, 32]  # Channels for the two resize-and-convolve stages.

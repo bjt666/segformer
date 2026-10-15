@@ -1,6 +1,6 @@
 # GF 假彩色输入的 SegFormer 基线与结构消融
 
-用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。
+用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。当前新增方向是只修改解码器的渐进融合与可学习上采样；旧 A/B 实验保留用于复现。
 
 ## 基线设置
 
@@ -15,9 +15,50 @@
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
 
-## A/B 结构与配置开关
+## 新解码器：当前方向验证
 
-默认配置 `configs/segformer_b0.yaml` 中两个模块均关闭，使用原版 SegFormer。新增处理发生在编码器输出与原版 MLP 解码器之间，编码器结构和原版解码器计算保留：
+这一轮只修改解码器：编码器及 F1、F2、F3、F4 四层输出保持原结构，不增加原图分支，三个新配置的 `module_a`、`module_b` 均为 `false`，不叠加旧 A/B 模块。目前没有实验增益或创新性结论，需要先检查当前数据划分上的验证表现。
+
+### 融合与上采样
+
+四层特征均先经过各自的线性投影，统一到 256 通道。融合可选：
+
+- `decoder_fusion: mlp`：精确复用原版四层并行 MLP 融合，包括对齐到 F1、拼接、原融合卷积、BN 和 ReLU。
+- `decoder_fusion: progressive`：从投影后的 F4 开始，依次双线性对齐到 F3、F2、F1 的实际空间尺寸；每次与对应投影特征相加，再经过 `3×3 Conv → BN → ReLU`。三次融合后停在 F1，标称为输入的 1/4 尺度。
+
+融合后的特征采用以下一种输出方式：
+
+- `decoder_upsampling: bilinear`：在 F1 尺度经过 dropout 和 `1×1` 分类层输出 logits，再由现有训练、评估和预测流程双线性插值到输入尺寸。
+- `decoder_upsampling: learned`：先用 `1×1` 卷积降到 64 通道，双线性上采样到原输入的半尺寸，再用 `3×3 Conv → BN → ReLU` 细化；随后用 `1×1` 卷积降到 32 通道，双线性上采样到精确原输入尺寸，再用 `3×3 Conv → BN → ReLU` 细化；最后经过 dropout 和 `1×1` 分类层输出 logits。各级目标尺寸由实际输入尺寸确定，不依赖连续两次固定倍率来推算最终尺寸。
+
+这里的可学习上采样是在插值后的特征上学习细化，内部仍使用双线性插值；它不是超分辨率，也不保证补回编码或降采样中丢失的信息。
+
+### 配置与四组消融
+
+新增的完整配置字段如下，YAML 未写这些字段时自动采用默认值：
+
+| 字段 | 默认值 | 可选值与含义 |
+| --- | --- | --- |
+| `decoder_fusion` | `mlp` | `mlp`：原版并行融合；`progressive`：F4 → F3 → F2 → F1 渐进融合 |
+| `decoder_upsampling` | `bilinear` | `bilinear`：F1 分类后插值 logits；`learned`：逐级上采样并细化特征，在原尺寸分类 |
+| `upsample_channels` | `[64, 32]` | 两级可学习上采样的通道数，仅 `learned` 使用 |
+
+当 A/B 关闭且采用默认 `mlp + bilinear` 时，使用原始 Hugging Face SegFormer 模型；旧 baseline YAML 不包含新字段时行为保持一致。各新配置完整保留 baseline 的预训练来源、NIR/R/G 波段、数据路径、seed 42、100 轮、batch size 8、优化器和损失等设置。
+
+| 版本 | 完整配置文件 | 融合 | 输出方式 | 用途 |
+| --- | --- | --- | --- | --- |
+| 原版基线 | `configs/segformer_b0.yaml` | `mlp` | `bilinear` | 当前路线的对照 |
+| 仅渐进融合 | `configs/segformer_b0_decoder_progressive.yaml` | `progressive` | `bilinear` | 检查逐级融合的作用 |
+| 仅可学习上采样 | `configs/segformer_b0_decoder_upsample.yaml` | `mlp` | `learned` | 检查原尺寸分类前的特征细化 |
+| 完整解码器 | `configs/segformer_b0_decoder_full.yaml` | `progressive` | `learned` | 首轮方向验证 |
+
+全部解码器参数（包括投影、融合、上采样和分类层）使用 `decoder_lr: 0.0006` 参数组；编码器使用 `encoder_lr: 0.00006`。ImageNet 预训练只加载编码器，解码器随机初始化，训练时全部参数更新。各版本必须独立开始新训练，不能用旧 `best.pt` 或前一版本的 `--resume` 启动新结构。
+
+首轮可先训练完整解码器，与已有、设置一致的原版基线比较；不要求立即跑满四组。若需要区分融合与上采样各自的作用，再独立运行两组单项消融。一次 seed 的结果仅用于判断下一步方向，不能据此确认稳定增益。
+
+## 旧 A/B 结构与配置开关（保留复现）
+
+本节是之前的局部补充与门控路线，保留其配置和诊断流程用于复现，当前优先验证上面的解码器路线。旧配置采用默认 `mlp + bilinear`；其中 `configs/segformer_b0.yaml` 的 A/B 均关闭，使用原版 SegFormer。旧 A/B 处理发生在编码器输出与原版 MLP 解码器之间，编码器结构和原版解码器计算保留：
 
 - **A：多感受野局部补充。** 默认分别处理 F1、F2。每个局部分支采用深度卷积、GELU 和逐点卷积，生成新增信息；A-only 将分支结果取平均后加回原特征。
 - **B：深浅联合门控。** 由原浅层特征、A 的局部候选和对齐后的 F3/F4 上下文生成每个分支的空间 sigmoid 权重，再将加权补充加回原特征。门控只作用于新增信息，不直接过滤原浅层路径。各分支权重独立，不使用必须总和为 1 的 softmax，因此可同时减小。
@@ -29,7 +70,7 @@ B 用于选择 A 的候选信息，因此不提供 B 开启而 A 关闭的版本
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
-| `module_a` | `false` | 开启局部残差分支；关闭时使用原版模型 |
+| `module_a` | `false` | 开启旧局部残差分支；关闭时跳过该模块，解码器仍由新字段决定 |
 | `module_b` | `false` | 开启分支门控，要求 A 已开启 |
 | `local_kernels` | `[3, 5, 7]` | 局部分支卷积核；奇数 3–31，可重复 |
 | `refinement_stages` | `[1, 2]` | 处理 F1/F2，编号从 1 开始；可选 `[1]` 或 `[2]` |
@@ -46,7 +87,7 @@ B 用于选择 A 的候选信息，因此不提供 B 开启而 A 关闭的版本
 | --- | --- | --- | --- |
 | `segformer_b0.yaml` | 关闭 | 关闭 | 原版基线 |
 | `segformer_b0_a.yaml` | 开启 | 关闭 | 多感受野、固定平均融合 |
-| `segformer_b0_ab.yaml` | 开启 | 深浅联合 | 完整候选结构 |
+| `segformer_b0_ab.yaml` | 开启 | 深浅联合 | 旧 A/B 完整结构 |
 | `segformer_b0_a_shallow_gate.yaml` | 开启 | 浅层门控 | 检验深层引导的作用 |
 | `segformer_b0_single_scale.yaml` | `[3, 3, 3]` | 关闭 | A 的单感受野对照，保留三个独立分支 |
 | `segformer_b0_ab_single_scale.yaml` | `[3, 3, 3]` | 深浅联合 | 完整结构中的单感受野对照 |
@@ -60,6 +101,9 @@ B 用于选择 A 的候选信息，因此不提供 B 开启而 A 关闭的版本
 ```text
 configs/
   segformer_b0.yaml
+  segformer_b0_decoder_progressive.yaml
+  segformer_b0_decoder_upsample.yaml
+  segformer_b0_decoder_full.yaml
   segformer_b0_a.yaml
   segformer_b0_ab.yaml
   segformer_b0_a_shallow_gate.yaml
@@ -69,7 +113,8 @@ segformer_baseline/
   config.py          配置读取和校验
   dataset.py         TIFF 读取、增强、归一化、数据指纹
   model.py           模型构建和预训练适配
-  refinement.py      A 局部补充、B 分支门控和原版解码器包装
+  refinement.py      旧 A 局部补充、B 分支门控和原版解码器包装
+  decoder.py         渐进融合、可学习上采样和解码器包装
   engine.py          训练与评估循环
   metrics.py         二分类指标
   checkpoint.py      检查点和随机状态恢复
@@ -164,9 +209,53 @@ tail -f outputs/segformer-b0-seed42-run1/console.log
 
 从头随机初始化的独立实验用 `--no-pretrained`，输出到新目录。
 
-### 首轮 GF 16 m 结构实验
+### 首轮 GF 16 m 解码器实验（当前推荐）
 
-先按顺序独立训练 **Baseline → A 固定融合 → A+B 深浅联合门控**。不要使用 `--resume` 从前一版本启动后一版本。以下实验目录仅为示例，已存在时请换新名称：
+先独立训练完整解码器，使用新实验目录：
+
+```bash
+python train.py --config configs/segformer_b0_decoder_full.yaml --output-dir outputs/gf16m_decoder_full_s42
+```
+
+若服务器首次下载 Hugging Face 权重超时，在同一个终端执行 `source /etc/network_turbo` 后重试；已有本地编码器目录时，在上述命令追加 `--pretrained-model /root/models/mit-b0`。已有的完整训练检查点在续训、评估和预测时会自动离线重建保存的结构，不另传 `--config`，也不需要下载编码器。
+
+训练后先评估验证集：
+
+```bash
+python evaluate.py \
+  --data-root dataset \
+  --checkpoint outputs/gf16m_decoder_full_s42/checkpoints/best.pt \
+  --split val
+```
+
+对比已有原版基线时，核对其数据划分、波段、预训练、损失、训练设置和 seed 是否一致。优先比较前景 IoU、F1、Precision、Recall、固定样本预测及模型规模和耗时；这轮先验证方向，尚无增益或创新结论。只有需要定位两部分作用时，再按四组表补跑独立实验，例如：
+
+```bash
+python train.py --config configs/segformer_b0.yaml --output-dir outputs/gf16m_decoder_baseline_s42
+python train.py --config configs/segformer_b0_decoder_progressive.yaml --output-dir outputs/gf16m_decoder_progressive_s42
+python train.py --config configs/segformer_b0_decoder_upsample.yaml --output-dir outputs/gf16m_decoder_upsample_s42
+```
+
+以上输出路径都应是新目录；已存在时换新名称，避免覆盖旧结果。所有版本独立加载 ImageNet 编码器并随机初始化解码器，不能将旧基线 `best.pt` 当成新结构的续训起点。需要恢复完整解码器自身的中断训练时，直接使用它的 `last.pt`：
+
+```bash
+python train.py --resume outputs/gf16m_decoder_full_s42/checkpoints/last.pt
+```
+
+预测同样直接指定检查点，结构和归一化统计由检查点恢复：
+
+```bash
+python predict.py \
+  --checkpoint outputs/gf16m_decoder_full_s42/checkpoints/best.pt \
+  --input dataset/images/val \
+  --mask-dir dataset/masks/val
+```
+
+有初步收益后，再对主要版本运行相同的多个 seed 并报告均值与标准差；按验证集选择结构后，才进行最终测试集评估。
+
+### 旧 GF 16 m A/B 结构实验（保留复现）
+
+如需复现旧路线，按顺序独立训练 **Baseline → A 固定融合 → A+B 深浅联合门控**。不要使用 `--resume` 从前一版本启动后一版本。以下实验目录仅为示例，已存在时请换新名称：
 
 ```bash
 python train.py --config configs/segformer_b0.yaml --output-dir outputs/gf16m-b0-baseline-seed42
@@ -195,7 +284,7 @@ outputs/实验名称/
   config.yaml                  实际训练配置
   run_config.json              同一配置的 JSON 版本
   preprocessing.json           输入波段和训练集归一化统计
-  architecture.json            A/B 开关、局部分支与门控结构设置
+  architecture.json            解码器融合/上采样设置及旧 A/B 结构设置
   model_summary.json           模型参数量及模型结构记录
   environment.json             原始环境、GPU、Git 提交号和工作区状态
   sessions.json                每次启动/恢复的环境和参数

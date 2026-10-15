@@ -17,6 +17,8 @@ from .metrics import confusion_matrix, metrics_from_confusion
 
 def resized_logits(model, images: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
     logits = model(pixel_values=images).logits
+    if logits.shape[-2:] == tuple(size):
+        return logits
     return F.interpolate(logits, size=size, mode="bilinear", align_corners=False)
 
 

@@ -1,6 +1,6 @@
 # GF 假彩色输入的 SegFormer 基线与结构消融
 
-用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。当前新增方向是只修改解码器的渐进融合与可学习上采样；旧 A/B 实验保留用于复现。
+用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。当前新增实验是原版 SegFormer MLP 解码器加独立开关控制的 FreqFusion；此前的渐进融合、可学习上采样与旧 A/B 实验保留用于复现。
 
 ## 基线设置
 
@@ -15,9 +15,77 @@
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
 
-## 新解码器：当前方向验证
+## FreqFusion：原版基线加新模块（当前实验）
 
-这一轮只修改解码器：编码器及 F1、F2、F3、F4 四层输出保持原结构，不增加原图分支，三个新配置的 `module_a`、`module_b` 均为 `false`，不叠加旧 A/B 模块。目前没有实验增益或创新性结论，需要先检查当前数据划分上的验证表现。
+使用 `configs/segformer_b0_freqfusion.yaml`，独立训练 **Baseline + FreqFusion**：
+
+- `freqfusion: true`：启用 FreqFusion。原版基线配置为 `false`；旧 YAML 未写此字段时也默认关闭。
+- `decoder_fusion: mlp`、`decoder_upsampling: bilinear`：关闭此前改造的渐进融合和可学习上采样。
+- `module_a: false`、`module_b: false`：关闭旧 A/B。本轮不支持 FreqFusion 与旧 A/B 组合。
+- 编码器、NIR/R/G 输入、ImageNet 初始化、损失、学习率、100 轮和 seed 42 等沿用基线设置；新增模块随机初始化，训练时全部参数更新。
+
+**网络中发生的变化：**保留四层特征的原线性投影。FreqFusion 按 F4 → F3 → F2 → F1 逐级对齐、处理特征；聚合特征的通道数依次为 D、2D、3D、4D，其中 D=256。最后仍使用原版解码器的四层特征拼接顺序和原融合层、BN、ReLU、dropout、分类层，在 F1 尺度分类后双线性恢复 logits 到输入尺寸。这里没有加入此前 `progressive` 解码器的三个 `3×3 Conv → BN → ReLU` 融合块。
+
+FreqFusion 根据两路特征生成低通／高通核，并通过局部相似度引导的重采样调整上采样特征；目标是检验内容相关的跨尺度融合是否有效，不能预设提高指标。该实现是依据 [FreqFusion 论文](https://arxiv.org/abs/2408.12879)（TPAMI 2024，DOI：10.1109/TPAMI.2024.3449959）与[作者源码](https://github.com/Linwei-Chen/FreqFusion)机制进行的独立实现和本工程适配，不是逐字复制作者代码，也不声称数值复现原论文结果。
+
+| 字段 | 本轮配置值 | 含义 |
+| --- | --- | --- |
+| `freqfusion` | `true` | 模块总开关，默认 `false` |
+| `freqfusion_compressed_channels` | `64` | 核预测和特征相似度计算所用压缩通道数 |
+| `freqfusion_lowpass_kernel` | `5` | 自适应低通核边长 |
+| `freqfusion_highpass_kernel` | `3` | 自适应高通核边长 |
+| `freqfusion_resample_groups` | `4` | 局部相似度引导的重采样分组数 |
+| `freqfusion_checkpoint` | `true` | 训练时重计算部分中间量以节省显存，可能增加耗时 |
+| `freqfusion_chunk_size` | `32` | 内容相关重组按通道分块计算的块大小，用于控制峰值显存 |
+
+模块采用纯 PyTorch 运算，不新增 MMCV、自定义 CUDA 扩展或其他依赖。它仍会增加计算和显存开销。后续可与 `progressive`／`learned` 组合验证，但当前配置明确关闭这两项，避免混合实验。
+
+适配细节：动态重组采用低分辨率邻域展开和通道分块；边缘使用 `replicate` 填充；奇数尺寸的相邻特征通过补齐、计算和裁剪处理；保留 Hugging Face 的四路通道拼接顺序。这些实现选择应在复现实验时记录。
+
+### 训练、续训与测试
+
+在 AutoDL 项目根目录开始新的独立训练，输出目录必须尚未使用：
+
+```bash
+cd /root/segformer
+python train.py --config configs/segformer_b0_freqfusion.yaml --output-dir outputs/gf16m_freqfusion_s42
+```
+
+启动日志和 `architecture.json` 应显示 `freqfusion: true`、`decoder_fusion: mlp`、`decoder_upsampling: bilinear`，且 A/B 均为 `false`。`model_summary.json` 单独记录 FreqFusion 参数数量；本轮 `decoder_redesign` 为 0，表示没有实例化此前的解码器改造部分。
+
+首次下载预训练编码器超时，可在同一个终端执行 `source /etc/network_turbo` 后重试。若编码器已经完整缓存，可强制本次新训练离线加载：
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python train.py --config configs/segformer_b0_freqfusion.yaml --output-dir outputs/gf16m_freqfusion_s42
+```
+
+离线变量不会下载缺失文件。已有本地 Hugging Face 编码器目录时，可在训练命令追加 `--pretrained-model /root/models/mit-b0`。新实验仍从 ImageNet 编码器初始化，不能使用旧基线或改进解码器的 `--resume` 来启动。
+
+中断后恢复 FreqFusion 实验自身的完整状态：
+
+```bash
+python train.py --resume outputs/gf16m_freqfusion_s42/checkpoints/last.pt
+```
+
+结构与模块配置随检查点保存，恢复、评估和预测会自动重建。将 YAML 中的 `freqfusion` 改为 `false`，只对下一次独立新训练生效；不能用它改变已有检查点的结构。在本轮其他开关保持不变时，关闭 FreqFusion 就是原版基线。
+
+验证集用于选择方案；确定本轮结果后，用验证集选出的最佳检查点评估测试集：
+
+```bash
+python evaluate.py --data-root dataset --checkpoint outputs/gf16m_freqfusion_s42/checkpoints/best.pt --split test
+```
+
+指标默认保存在 `outputs/gf16m_freqfusion_s42/evaluation/test-时间戳/metrics.json`，默认只导出 8 张预览，但指标覆盖全部测试图像。导出测试集每张图的预测掩膜、叠加图和有真值的对比图：
+
+```bash
+python predict.py --checkpoint outputs/gf16m_freqfusion_s42/checkpoints/best.pt --input dataset/images/test --mask-dir dataset/masks/test
+```
+
+预测默认保存在 `outputs/gf16m_freqfusion_s42/predictions/时间戳/` 的 `masks/`、`overlays/`、`comparisons/`。原始实验目录保留不动；比较时使用相同数据划分、初始化来源和训练设置。
+
+## 新解码器：保留独立消融
+
+以下配置保留此前只改解码器的路线：编码器及 F1、F2、F3、F4 四层输出保持原结构，不增加原图分支，三个配置的 `module_a`、`module_b` 均为 `false`，默认关闭 FreqFusion。是否存在稳定收益仍需通过相同设置下的独立实验和多个 seed 判断。
 
 ### 融合与上采样
 
@@ -43,7 +111,7 @@
 | `decoder_upsampling` | `bilinear` | `bilinear`：F1 分类后插值 logits；`learned`：逐级上采样并细化特征，在原尺寸分类 |
 | `upsample_channels` | `[64, 32]` | 两级可学习上采样的通道数，仅 `learned` 使用 |
 
-当 A/B 关闭且采用默认 `mlp + bilinear` 时，使用原始 Hugging Face SegFormer 模型；旧 baseline YAML 不包含新字段时行为保持一致。各新配置完整保留 baseline 的预训练来源、NIR/R/G 波段、数据路径、seed 42、100 轮、batch size 8、优化器和损失等设置。
+当 A/B 和 FreqFusion 均关闭且采用默认 `mlp + bilinear` 时，使用原始 Hugging Face SegFormer 模型；旧 baseline YAML 不包含新字段时行为保持一致。各新配置完整保留 baseline 的预训练来源、NIR/R/G 波段、数据路径、seed 42、100 轮、batch size 8、优化器和损失等设置。
 
 | 版本 | 完整配置文件 | 融合 | 输出方式 | 用途 |
 | --- | --- | --- | --- | --- |
@@ -58,7 +126,7 @@
 
 ## 旧 A/B 结构与配置开关（保留复现）
 
-本节是之前的局部补充与门控路线，保留其配置和诊断流程用于复现，当前优先验证上面的解码器路线。旧配置采用默认 `mlp + bilinear`；其中 `configs/segformer_b0.yaml` 的 A/B 均关闭，使用原版 SegFormer。旧 A/B 处理发生在编码器输出与原版 MLP 解码器之间，编码器结构和原版解码器计算保留：
+本节是之前的局部补充与门控路线，保留其配置和诊断流程用于复现。旧配置采用默认 `mlp + bilinear` 且关闭 FreqFusion；其中 `configs/segformer_b0.yaml` 的 A/B 均关闭，使用原版 SegFormer。旧 A/B 处理发生在编码器输出与原版 MLP 解码器之间，编码器结构和原版解码器计算保留：
 
 - **A：多感受野局部补充。** 默认分别处理 F1、F2。每个局部分支采用深度卷积、GELU 和逐点卷积，生成新增信息；A-only 将分支结果取平均后加回原特征。
 - **B：深浅联合门控。** 由原浅层特征、A 的局部候选和对齐后的 F3/F4 上下文生成每个分支的空间 sigmoid 权重，再将加权补充加回原特征。门控只作用于新增信息，不直接过滤原浅层路径。各分支权重独立，不使用必须总和为 1 的 softmax，因此可同时减小。
@@ -101,6 +169,7 @@ B 用于选择 A 的候选信息，因此不提供 B 开启而 A 关闭的版本
 ```text
 configs/
   segformer_b0.yaml
+  segformer_b0_freqfusion.yaml
   segformer_b0_decoder_progressive.yaml
   segformer_b0_decoder_upsample.yaml
   segformer_b0_decoder_full.yaml
@@ -115,6 +184,7 @@ segformer_baseline/
   model.py           模型构建和预训练适配
   refinement.py      旧 A 局部补充、B 分支门控和原版解码器包装
   decoder.py         渐进融合、可学习上采样和解码器包装
+  freqfusion.py      自适应滤波、局部相似度重采样和内容相关重组
   engine.py          训练与评估循环
   metrics.py         二分类指标
   checkpoint.py      检查点和随机状态恢复
@@ -209,7 +279,7 @@ tail -f outputs/segformer-b0-seed42-run1/console.log
 
 从头随机初始化的独立实验用 `--no-pretrained`，输出到新目录。
 
-### 首轮 GF 16 m 解码器实验（当前推荐）
+### 首轮 GF 16 m 解码器实验（保留复现）
 
 先独立训练完整解码器，使用新实验目录：
 
@@ -284,7 +354,7 @@ outputs/实验名称/
   config.yaml                  实际训练配置
   run_config.json              同一配置的 JSON 版本
   preprocessing.json           输入波段和训练集归一化统计
-  architecture.json            解码器融合/上采样设置及旧 A/B 结构设置
+  architecture.json            FreqFusion、解码器融合/上采样及旧 A/B 结构设置
   model_summary.json           模型参数量及模型结构记录
   environment.json             原始环境、GPU、Git 提交号和工作区状态
   sessions.json                每次启动/恢复的环境和参数

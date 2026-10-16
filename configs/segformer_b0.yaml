@@ -32,3 +32,6 @@ residual_init_std: 0.001
 decoder_fusion: mlp
 decoder_upsampling: bilinear
 upsample_channels: [64, 32]  # Used only for learned upsampling.
+
+# Optional frequency-aware alignment; false retains the original HF baseline.
+freqfusion: false

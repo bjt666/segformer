@@ -88,6 +88,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant = "a" if not config["module_b"] else f"ab-{config['gate_mode']}"
         elif config["decoder_fusion"] != "mlp" or config["decoder_upsampling"] != "bilinear":
             variant = f"decoder-{config['decoder_fusion']}-{config['decoder_upsampling']}"
+        if config["freqfusion"]:
+            variant = "freqfusion" if variant == "baseline" else f"{variant}-freqfusion"
         config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())

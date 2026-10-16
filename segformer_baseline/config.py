@@ -23,6 +23,10 @@ DEFAULTS: dict[str, Any] = {
     "gate_init_probability": 1 / 3, "residual_init_std": 0.001,
     "decoder_fusion": "mlp", "decoder_upsampling": "bilinear",
     "upsample_channels": [64, 32],
+    "freqfusion": False, "freqfusion_compressed_channels": 64,
+    "freqfusion_lowpass_kernel": 5, "freqfusion_highpass_kernel": 3,
+    "freqfusion_resample_groups": 4, "freqfusion_checkpoint": True,
+    "freqfusion_chunk_size": 32,
 }
 
 
@@ -57,7 +61,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("weight_decay must be nonnegative.")
     if type(config["pretrained"]) is not bool:
         raise ValueError("pretrained must be true or false.")
-    for key in ("module_a", "module_b"):
+    for key in ("module_a", "module_b", "freqfusion", "freqfusion_checkpoint"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be true or false.")
     if config["module_b"] and not config["module_a"]:
@@ -73,11 +77,21 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("upsample_channels must contain two positive integer channel counts.")
     if (config["module_a"] or config["module_b"]) and (
         config["decoder_fusion"] != "mlp" or config["decoder_upsampling"] != "bilinear"
+        or config["freqfusion"]
     ):
         raise ValueError(
-            "Decoder redesign experiments require module_a: false and module_b: false. "
+            "Decoder redesign/FreqFusion experiments require module_a: false and module_b: false. "
             "Use the original mlp/bilinear decoder for the earlier A/B experiments."
         )
+    for key in ("freqfusion_compressed_channels", "freqfusion_resample_groups", "freqfusion_chunk_size"):
+        if type(config[key]) is not int or config[key] < 1:
+            raise ValueError(f"{key} must be a positive integer.")
+    if config["freqfusion_compressed_channels"] < 8:
+        raise ValueError("freqfusion_compressed_channels must be at least eight.")
+    for key in ("freqfusion_lowpass_kernel", "freqfusion_highpass_kernel"):
+        kernel = config[key]
+        if type(kernel) is not int or not 3 <= kernel <= 15 or kernel % 2 != 1:
+            raise ValueError(f"{key} must be an odd integer from 3 to 15.")
     kernels = config["local_kernels"]
     if not isinstance(kernels, list) or not kernels or any(
         type(kernel) is not int or not 3 <= kernel <= 31 or kernel % 2 != 1

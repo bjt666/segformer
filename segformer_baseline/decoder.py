@@ -17,6 +17,8 @@ from torch.nn import functional as F
 from transformers import SegformerForSemanticSegmentation
 from transformers.modeling_outputs import SemanticSegmenterOutput
 
+from .freqfusion import FreqFusion
+
 if TYPE_CHECKING:
     from transformers import SegformerConfig
 
@@ -43,12 +45,17 @@ class _ProgressiveFusion(nn.Module):
             {stage: _ConvBnRelu(width) for stage in ("f3", "f2", "f1")}
         )
 
-    def forward(self, projected_features: list[torch.Tensor]) -> torch.Tensor:
+    def forward(
+        self, projected_features: list[torch.Tensor], freqfusion_blocks: nn.ModuleDict | None = None
+    ) -> torch.Tensor:
         features = projected_features[-1]
-        for block, shallow in zip(self.blocks.values(), reversed(projected_features[:-1])):
-            features = F.interpolate(
-                features, size=shallow.shape[-2:], mode="bilinear", align_corners=False
-            )
+        for (stage, block), shallow in zip(self.blocks.items(), reversed(projected_features[:-1])):
+            if freqfusion_blocks is None:
+                features = F.interpolate(
+                    features, size=shallow.shape[-2:], mode="bilinear", align_corners=False
+                )
+            else:
+                shallow, features = freqfusion_blocks[stage](shallow, features)
             features = block(features + shallow)
         return features
 
@@ -100,6 +107,9 @@ class DecoderHead(nn.Module):
     resolution for the existing engine to resize. Learned mode registers two
     feature recovery stages and a classifier at the final recovery width; it
     requires the actual input image dimensions and returns full input logits.
+    Optional FreqFusion changes the cross-scale alignment of either fusion
+    pathway. In MLP mode it recursively aligns and concatenates all projected
+    branches, retaining the original final fusion and classifier layers.
     Fusion width is always ``model_config.decoder_hidden_size``.
     """
 
@@ -109,6 +119,7 @@ class DecoderHead(nn.Module):
         super().__init__()
         self.fusion = architecture.get("decoder_fusion", "mlp")
         self.upsampling = architecture.get("decoder_upsampling", "bilinear")
+        self.freqfusion = architecture.get("freqfusion", False)
         if self.fusion not in {"mlp", "progressive"}:
             raise ValueError("decoder_fusion must be 'mlp' or 'progressive'.")
         if self.upsampling not in {"bilinear", "learned"}:
@@ -155,6 +166,24 @@ class DecoderHead(nn.Module):
                 self.learned_upsampling = _LearnedUpsampling(width, tuple(channels))
                 self.classifier = nn.Conv2d(channels[-1], model_config.num_labels, kernel_size=1)
 
+        if self.freqfusion:
+            if width % architecture["freqfusion_resample_groups"]:
+                raise ValueError("decoder_hidden_size must be divisible by freqfusion_resample_groups.")
+            # Isolate the new modules from the initialization of all reused
+            # layers and from either optional decoder redesign component.
+            with torch.random.fork_rng(devices=[]):
+                self.freqfusion_blocks = nn.ModuleDict({
+                    stage: FreqFusion(
+                        width, width * (index + 1 if self.fusion == "mlp" else 1),
+                        compressed_channels=architecture["freqfusion_compressed_channels"],
+                        lowpass_kernel=architecture["freqfusion_lowpass_kernel"],
+                        highpass_kernel=architecture["freqfusion_highpass_kernel"],
+                        resample_groups=architecture["freqfusion_resample_groups"],
+                        checkpoint_reassembly=architecture["freqfusion_checkpoint"],
+                        chunk_size=architecture["freqfusion_chunk_size"],
+                    ) for index, stage in enumerate(("f3", "f2", "f1"))
+                })
+
     def forward(
         self,
         encoder_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor],
@@ -182,19 +211,33 @@ class DecoderHead(nn.Module):
             projected_features.append(projected.reshape(batch_size, -1, height, width))
 
         if self.fusion == "mlp":
-            aligned = [
-                F.interpolate(
-                    features,
-                    size=encoder_hidden_states[0].shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                for features in projected_features
-            ]
-            features = self.linear_fuse(torch.cat(aligned[::-1], dim=1))
+            if self.freqfusion:
+                # Preserve all four projected branches and the original
+                # F4/F3/F2/F1 channel order. Unlike progressive fusion, there
+                # are no per-stage additions or extra 3x3 fusion convolutions.
+                features = projected_features[-1]
+                for module, shallow in zip(
+                    self.freqfusion_blocks.values(), reversed(projected_features[:-1])
+                ):
+                    shallow, features = module(shallow, features)
+                    features = torch.cat((features, shallow), dim=1)
+            else:
+                aligned = [
+                    F.interpolate(
+                        features,
+                        size=encoder_hidden_states[0].shape[-2:],
+                        mode="bilinear",
+                        align_corners=False,
+                    )
+                    for features in projected_features
+                ]
+                features = torch.cat(aligned[::-1], dim=1)
+            features = self.linear_fuse(features)
             features = self.activation(self.batch_norm(features))
         else:
-            features = self.progressive_fusion(projected_features)
+            features = self.progressive_fusion(
+                projected_features, self.freqfusion_blocks if self.freqfusion else None
+            )
 
         if self.upsampling == "learned":
             features = self.learned_upsampling(features, input_size)

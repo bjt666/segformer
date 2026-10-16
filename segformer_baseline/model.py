@@ -17,6 +17,9 @@ ARCHITECTURE_FIELDS = (
     "module_a", "module_b", "local_kernels", "refinement_stages", "gate_mode",
     "gate_reduction", "gate_init_probability", "residual_init_std",
     "decoder_fusion", "decoder_upsampling", "upsample_channels",
+    "freqfusion", "freqfusion_compressed_channels", "freqfusion_lowpass_kernel",
+    "freqfusion_highpass_kernel", "freqfusion_resample_groups", "freqfusion_checkpoint",
+    "freqfusion_chunk_size",
 )
 
 
@@ -71,28 +74,39 @@ def model_parameter_counts(model) -> dict:
     count = lambda module: sum(parameter.numel() for parameter in module.parameters())
     encoder = count(model.segformer)
     decoder = count(model.decode_head)
+    freqfusion = count(model.decode_head.freqfusion_blocks) if (
+        isinstance(model.decode_head, DecoderHead) and model.decode_head.freqfusion
+    ) else 0
     if isinstance(model.decode_head, RefinedDecodeHead):
         original_decoder = count(model.decode_head.original_head)
         refinement, redesign = decoder - original_decoder, 0
     elif isinstance(model.decode_head, DecoderHead):
-        # This is a replacement head, including any reused projection modules.
-        original_decoder, refinement, redesign = 0, 0, decoder
+        refinement = 0
+        if model.decode_head.fusion == "mlp" and model.decode_head.upsampling == "bilinear":
+            original_decoder, redesign = decoder - freqfusion, 0
+        else:
+            # Replacement head, excluding the separately reported FF modules.
+            original_decoder, redesign = 0, decoder - freqfusion
     else:
         original_decoder, refinement, redesign = decoder, 0, 0
     return {"total": count(model), "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
             "encoder": encoder, "decoder": decoder, "original_decoder": original_decoder,
-            "refinement": refinement, "decoder_redesign": redesign}
+            "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion}
 
 
 def _uses_decoder_redesign(architecture: dict) -> bool:
     return architecture["decoder_fusion"] != "mlp" or architecture["decoder_upsampling"] != "bilinear"
 
 
+def _uses_custom_decoder(architecture: dict) -> bool:
+    return _uses_decoder_redesign(architecture) or architecture["freqfusion"]
+
+
 def _attach_architecture(model, architecture: dict) -> None:
     # Retain the schema-2 metadata key so old A/B checkpoints remain readable.
     # It now describes all optional decoder and refinement switches.
     model.config.local_refinement = copy.deepcopy(architecture)
-    if _uses_decoder_redesign(architecture):
+    if _uses_custom_decoder(architecture):
         with torch.random.fork_rng(devices=[]):
             model.decode_head = DecoderHead(model.decode_head, model.config, architecture)
     elif architecture["module_a"]:
@@ -103,7 +117,7 @@ def _attach_architecture(model, architecture: dict) -> None:
 
 
 def _new_model(model_config: SegformerConfig, architecture: dict) -> SegformerForSemanticSegmentation:
-    model_class = (DecoderSegformerForSemanticSegmentation if _uses_decoder_redesign(architecture)
+    model_class = (DecoderSegformerForSemanticSegmentation if _uses_custom_decoder(architecture)
                    else SegformerForSemanticSegmentation)
     return model_class(model_config)
 
@@ -150,9 +164,9 @@ def build_model(config: dict) -> SegformerForSemanticSegmentation:
     model.load_state_dict(target_state)
     _attach_architecture(model, architecture)
     logging.getLogger("segformer").info(
-        "Loaded %s encoder tensors from %s; input=%s; decoder=%s/%s initialized randomly.",
+        "Loaded %s encoder tensors from %s; input=%s; decoder=%s/%s; freqfusion=%s. Decoder initialized randomly.",
         len(copied), config["pretrained_model"], config["input_bands"],
-        architecture["decoder_fusion"], architecture["decoder_upsampling"],
+        architecture["decoder_fusion"], architecture["decoder_upsampling"], architecture["freqfusion"],
     )
     return model
 

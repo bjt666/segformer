@@ -1,6 +1,6 @@
 # GF 假彩色输入的 SegFormer 基线与结构消融
 
-用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。当前新增实验是原版 SegFormer MLP 解码器加独立开关控制的 FreqFusion；此前的渐进融合、可学习上采样与旧 A/B 实验保留用于复现。
+用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion，以及改进解码器与 FreqFusion 的组合实验；旧 A/B 实验保留用于复现。
 
 ## 基线设置
 
@@ -15,7 +15,7 @@
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
 
-## FreqFusion：原版基线加新模块（当前实验）
+## FreqFusion：原版基线加新模块
 
 使用 `configs/segformer_b0_freqfusion.yaml`，独立训练 **Baseline + FreqFusion**：
 
@@ -38,7 +38,7 @@ FreqFusion 根据两路特征生成低通／高通核，并通过局部相似度
 | `freqfusion_checkpoint` | `true` | 训练时重计算部分中间量以节省显存，可能增加耗时 |
 | `freqfusion_chunk_size` | `32` | 内容相关重组按通道分块计算的块大小，用于控制峰值显存 |
 
-模块采用纯 PyTorch 运算，不新增 MMCV、自定义 CUDA 扩展或其他依赖。它仍会增加计算和显存开销。后续可与 `progressive`／`learned` 组合验证，但当前配置明确关闭这两项，避免混合实验。
+模块采用纯 PyTorch 运算，不新增 MMCV、自定义 CUDA 扩展或其他依赖。它仍会增加计算和显存开销。组合实验使用下节的独立配置 `configs/segformer_b0_decoder_freqfusion.yaml`；本节的 FreqFusion 单开配置保持 `mlp + bilinear`。
 
 适配细节：动态重组采用低分辨率邻域展开和通道分块；边缘使用 `replicate` 填充；奇数尺寸的相邻特征通过补齐、计算和裁剪处理；保留 Hugging Face 的四路通道拼接顺序。这些实现选择应在复现实验时记录。
 
@@ -83,6 +83,52 @@ python predict.py --checkpoint outputs/gf16m_freqfusion_s42/checkpoints/best.pt 
 
 预测默认保存在 `outputs/gf16m_freqfusion_s42/predictions/时间戳/` 的 `masks/`、`overlays/`、`comparisons/`。原始实验目录保留不动；比较时使用相同数据划分、初始化来源和训练设置。
 
+## 完整改进解码器 + FreqFusion：组合实验
+
+使用 `configs/segformer_b0_decoder_freqfusion.yaml`，同时开启 `decoder_fusion: progressive`、`decoder_upsampling: learned` 和 `freqfusion: true`。旧 `module_a`、`module_b` 均关闭。四组主实验对应关系如下：
+
+| 实验 | 配置文件 | `decoder_fusion` | `decoder_upsampling` | `freqfusion` |
+| --- | --- | --- | --- | --- |
+| 原版基线 | `configs/segformer_b0.yaml` | `mlp` | `bilinear` | `false` |
+| 基线 + 完整改进解码器 | `configs/segformer_b0_decoder_full.yaml` | `progressive` | `learned` | `false` |
+| 基线 + FreqFusion | `configs/segformer_b0_freqfusion.yaml` | `mlp` | `bilinear` | `true` |
+| 基线 + 完整改进解码器 + FreqFusion | `configs/segformer_b0_decoder_freqfusion.yaml` | `progressive` | `learned` | `true` |
+
+**组合路径：**四层编码特征先各自投影到 256 通道，从 F4 开始依次与 F3、F2、F1 交互。每一级先由 FreqFusion 处理浅层特征并对齐深层特征，再将两路相加，经过 `3×3 Conv → BN → ReLU`；融合特征始终为 256 通道。最后使用两级可学习上采样恢复至输入尺寸，经 dropout 和分类层输出预测。FreqFusion 作用在逐级融合内部，不是串接在最终预测图之后。
+
+组合版本与 FreqFusion 单开版本使用相同机制和超参数，但单开 MLP 路径会逐级拼接通道，组合路径采用相加融合，因此模块输入通道和参数量不同。实际参数量以各实验的 `model_summary.json` 为准，不能直接将两个单开实验的参数增量相加。
+
+保持与前三组一致的数据划分、NIR/R/G、ImageNet 编码器初始化、交叉熵、学习率、batch size 8、100 轮和 seed 42，独立开始新训练：
+
+```bash
+cd /root/segformer
+python train.py --config configs/segformer_b0_decoder_freqfusion.yaml --output-dir outputs/gf16m_decoder_freqfusion_s42
+```
+
+若完整编码器已经缓存，可在同一训练命令前加 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`。本地编码器目录也可通过 `--pretrained-model /root/models/mit-b0` 指定。新实验的解码器和 FreqFusion 随机初始化，不使用前三组的检查点续训；输出目录必须尚未使用。
+
+启动后核对 `architecture.json`：`decoder_fusion` 为 `progressive`、`decoder_upsampling` 为 `learned`、`freqfusion` 为 `true`，A/B 均为 `false`。`model_summary.json` 中 `decoder_redesign` 与 `freqfusion` 参数量均应大于 0。配置和结构随检查点保存，评估与预测会自动恢复。
+
+仅在组合实验自身中断时恢复其状态：
+
+```bash
+python train.py --resume outputs/gf16m_decoder_freqfusion_s42/checkpoints/last.pt
+```
+
+验证集用于选择最佳检查点。训练完成后评估测试集：
+
+```bash
+python evaluate.py --data-root dataset --checkpoint outputs/gf16m_decoder_freqfusion_s42/checkpoints/best.pt --split test
+```
+
+测试指标保存在 `outputs/gf16m_decoder_freqfusion_s42/evaluation/test-时间戳/metrics.json`。默认评估预览为 8 张，指标覆盖全部测试图像。导出测试集全部预测图片：
+
+```bash
+python predict.py --checkpoint outputs/gf16m_decoder_freqfusion_s42/checkpoints/best.pt --input dataset/images/test --mask-dir dataset/masks/test
+```
+
+预测文件默认保存在 `outputs/gf16m_decoder_freqfusion_s42/predictions/时间戳/`。已有前三组在设置一致时可沿用，本轮补充组合实验即可；是否互补及是否稳定提升，需要根据实验结果判断。
+
 ## 新解码器：保留独立消融
 
 以下配置保留此前只改解码器的路线：编码器及 F1、F2、F3、F4 四层输出保持原结构，不增加原图分支，三个配置的 `module_a`、`module_b` 均为 `false`，默认关闭 FreqFusion。是否存在稳定收益仍需通过相同设置下的独立实验和多个 seed 判断。
@@ -101,7 +147,7 @@ python predict.py --checkpoint outputs/gf16m_freqfusion_s42/checkpoints/best.pt 
 
 这里的可学习上采样是在插值后的特征上学习细化，内部仍使用双线性插值；它不是超分辨率，也不保证补回编码或降采样中丢失的信息。
 
-### 配置与四组消融
+### 配置与解码器内部四组消融
 
 新增的完整配置字段如下，YAML 未写这些字段时自动采用默认值：
 
@@ -170,6 +216,7 @@ B 用于选择 A 的候选信息，因此不提供 B 开启而 A 关闭的版本
 configs/
   segformer_b0.yaml
   segformer_b0_freqfusion.yaml
+  segformer_b0_decoder_freqfusion.yaml
   segformer_b0_decoder_progressive.yaml
   segformer_b0_decoder_upsample.yaml
   segformer_b0_decoder_full.yaml

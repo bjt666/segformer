@@ -1,6 +1,6 @@
 # GF 假彩色输入的 SegFormer 基线与结构消融
 
-用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion，以及改进解码器与 FreqFusion 的组合实验；旧 A/B 实验保留用于复现。
+用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion、编码器前景／背景判别分支及其组合实验；旧 A/B 实验保留用于复现。
 
 ## 基线设置
 
@@ -14,6 +14,80 @@
 - 验证集的**前景 IoU**用于选择最佳模型。测试集不参与训练或选模。
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
+
+## 编码器前景／背景判别分支
+
+新分支在 **MiT 第 2 阶段的 F2 后**运行：先将 F2 投影到较小通道数，生成粗略的前景／背景概率；使用软概率在每张图内分别汇聚两类代表特征，再通过余弦相似度比较各位置与两类代表，结合类别上下文生成残差修正量。修正后的 **F2′ 同时输入第 3 阶段编码器和解码器**，F3、F4 因此也受到反馈影响。它不是只在四层编码结束后修改解码器输入。
+
+原编码器的预训练参数保留；新分支随机初始化，最后的残差投影为全零初始化，使初始修正量为零。保留原特征的残差通路，避免用粗预测硬删除弱目标。模型训练后修正量才可能逐渐产生作用，是否提高指标需要实验验证。
+
+这是借鉴前景／背景分离和类别代表特征思路的实验性适配，可参考 [CamoFormer](https://mftp.mmcheng.net/Papers/24PAMI-CamoFormer.pdf) 与 [Prototype-Based Semantic Segmentation](https://pure.bit.edu.cn/en/publications/prototype-based-semantic-segmentation/)。本实现不声称复现这些论文的完整结构或结果，代码适配本身也不代表已经证明方法创新。
+
+| 字段 | 默认值／本轮值 | 含义 |
+| --- | --- | --- |
+| `encoder_discrimination` | 默认 `false`，本轮 `true` | 新分支独立开关；旧配置省略时关闭 |
+| `discrimination_mode` | `feedback` | `feedback` 修正 F2；`auxiliary` 只训练粗分割头，不将修正反馈给编码器 |
+| `discrimination_channels` | `32` | 分支内部特征通道数 |
+| `discrimination_temperature` | `0.2` | 类别相似度转换为权重时的温度 |
+| `discrimination_aux_weight` | `0.2` | 粗分割辅助交叉熵的权重 |
+
+开启分支时，训练总损失为 **主分割交叉熵 + `discrimination_aux_weight` × 粗分割交叉熵**。粗预测只使用当前图像的特征，训练真值用于计算辅助监督；验证、测试和预测不读取真值来生成类别代表。辅助监督是新增训练条件，应与特征反馈作用分别消融。
+
+新分支采用 `decoder_lr`（本轮 `6e-4`），原编码器采用 `encoder_lr`（`6e-5`）。虽然新分支作用在编码器内部，但它没有 ImageNet 预训练，因此与随机初始化的解码器使用相同学习率。旧配置的优化设置保持原样；本模块不增加依赖库。
+
+### 配置与独立消融
+
+这里用 D 表示现有“渐进解码＋可学习上采样＋FreqFusion”，E 表示新增编码器判别分支：
+
+| 实验 | 配置文件 | 判别分支模式 |
+| --- | --- | --- |
+| 原版 B0 | `configs/segformer_b0.yaml` | 关闭 |
+| B0＋D | `configs/segformer_b0_decoder_freqfusion.yaml` | 关闭 |
+| B0＋E | `configs/segformer_b0_discrimination.yaml` | `feedback`，原版 MLP 解码器，FreqFusion 关闭 |
+| B0＋D＋E（本轮主实验） | `configs/segformer_b0_decoder_freqfusion_discrimination.yaml` | `feedback` |
+| B0＋D＋粗分割辅助监督 | `configs/segformer_b0_decoder_freqfusion_auxiliary.yaml` | `auxiliary`，F2 不修正 |
+
+所有新配置均关闭旧 A/B，保留 NIR/R/G、ImageNet 编码器初始化、100 轮、batch size 8、seed 42 等设置。已有 B0 与 B0＋D 结果在数据划分和训练设置一致时可沿用。每个新版本都从相同来源的 ImageNet 编码器独立训练；**不要通过 `--resume` 加载旧基线或旧组合实验的分割检查点来启动新结构**。
+
+服务器更新代码后，先运行本轮主实验，输出目录必须是新目录：
+
+```bash
+cd /root/segformer
+python train.py --config configs/segformer_b0_decoder_freqfusion_discrimination.yaml --output-dir outputs/gf16m_decoder_freqfusion_discrimination_s42
+```
+
+如果要分别验证新分支是否能独立起作用、增益是否主要来自辅助监督，再独立运行：
+
+```bash
+python train.py --config configs/segformer_b0_discrimination.yaml --output-dir outputs/gf16m_discrimination_s42
+python train.py --config configs/segformer_b0_decoder_freqfusion_auxiliary.yaml --output-dir outputs/gf16m_decoder_freqfusion_auxiliary_s42
+```
+
+已有完整 Hugging Face 编码器缓存时，可在新训练命令前加 `HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1`；离线模式不会补齐缺失文件。也可以追加 `--pretrained-model /root/models/mit-b0`，指定已保存的本地分类编码器目录。
+
+启动后检查 `architecture.json` 和 `model_summary.json`，确认 `encoder_discrimination: true`、`discrimination_mode: feedback`，以及本轮的解码器与 FreqFusion 开关。训练记录包含主分割、辅助和总训练损失，避免把总训练损失直接当成与旧基线完全相同的单一交叉熵。验证损失和验证指标仍针对最终分割预测，使用验证集前景 IoU 选出 `best.pt`。
+
+主实验中断后，从它自身的检查点恢复：
+
+```bash
+python train.py --resume outputs/gf16m_decoder_freqfusion_discrimination_s42/checkpoints/last.pt
+```
+
+新分支开关、模式和结构参数随检查点保存，续训、评估和预测会自动离线重建结构。修改 YAML 开关只影响下一次独立训练，不能用它改变已有检查点结构；旧实验仍按保存的原结构加载。
+
+确定方案后，使用验证集选出的最佳检查点评估**全部测试集**：
+
+```bash
+python evaluate.py --data-root dataset --checkpoint outputs/gf16m_decoder_freqfusion_discrimination_s42/checkpoints/best.pt --split test
+```
+
+指标保存在 `outputs/gf16m_decoder_freqfusion_discrimination_s42/evaluation/test-时间戳/metrics.json`，默认的 8 张预览不影响全测试集指标。导出测试集每张图的预测掩膜、叠加图和对比图：
+
+```bash
+python predict.py --checkpoint outputs/gf16m_decoder_freqfusion_discrimination_s42/checkpoints/best.pt --input dataset/images/test --mask-dir dataset/masks/test
+```
+
+预测图片保存在 `outputs/gf16m_decoder_freqfusion_discrimination_s42/predictions/时间戳/` 的 `masks/`、`overlays/`、`comparisons/`。另外两个新实验的续训、评估、预测只需替换各自的输出目录。
 
 ## FreqFusion：原版基线加新模块
 
@@ -401,7 +475,7 @@ outputs/实验名称/
   config.yaml                  实际训练配置
   run_config.json              同一配置的 JSON 版本
   preprocessing.json           输入波段和训练集归一化统计
-  architecture.json            FreqFusion、解码器融合/上采样及旧 A/B 结构设置
+  architecture.json            编码器判别分支、FreqFusion、解码器及旧 A/B 结构设置
   model_summary.json           模型参数量及模型结构记录
   environment.json             原始环境、GPU、Git 提交号和工作区状态
   sessions.json                每次启动/恢复的环境和参数

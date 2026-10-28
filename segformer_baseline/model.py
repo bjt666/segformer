@@ -10,6 +10,7 @@ from transformers import SegformerConfig, SegformerForImageClassification, Segfo
 
 from .config import DEFAULTS, default_config, validate_config
 from .decoder import DecoderHead, DecoderSegformerForSemanticSegmentation
+from .discrimination import DiscriminativeEncoder, DiscriminationSegformerForSemanticSegmentation
 from .refinement import RefinedDecodeHead
 
 
@@ -20,6 +21,8 @@ ARCHITECTURE_FIELDS = (
     "freqfusion", "freqfusion_compressed_channels", "freqfusion_lowpass_kernel",
     "freqfusion_highpass_kernel", "freqfusion_resample_groups", "freqfusion_checkpoint",
     "freqfusion_chunk_size",
+    "encoder_discrimination", "discrimination_mode", "discrimination_channels",
+    "discrimination_temperature", "discrimination_aux_weight",
 )
 
 
@@ -73,6 +76,9 @@ def model_parameter_counts(model) -> dict:
     """Parameter counts only; no FLOPs or timing estimates are inferred."""
     count = lambda module: sum(parameter.numel() for parameter in module.parameters())
     encoder = count(model.segformer)
+    discrimination = count(model.segformer.encoder.discrimination) if (
+        isinstance(model.segformer.encoder, DiscriminativeEncoder)
+    ) else 0
     decoder = count(model.decode_head)
     freqfusion = count(model.decode_head.freqfusion_blocks) if (
         isinstance(model.decode_head, DecoderHead) and model.decode_head.freqfusion
@@ -90,8 +96,26 @@ def model_parameter_counts(model) -> dict:
     else:
         original_decoder, refinement, redesign = decoder, 0, 0
     return {"total": count(model), "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            "encoder": encoder, "decoder": decoder, "original_decoder": original_decoder,
+            "encoder": encoder, "encoder_backbone": encoder - discrimination,
+            "encoder_discrimination": discrimination,
+            "decoder": decoder, "original_decoder": original_decoder,
             "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion}
+
+
+def optimizer_parameter_groups(model, config: dict) -> list[dict]:
+    """Keep the two legacy groups; new random branch uses the decoder rate.
+
+    With the branch disabled these lists preserve the original parameter order,
+    so schema-2 optimizer checkpoints remain loadable without migration.
+    """
+    branch = (model.segformer.encoder.discrimination
+              if isinstance(model.segformer.encoder, DiscriminativeEncoder) else None)
+    new_parameters = list(branch.parameters()) if branch is not None else []
+    new_ids = {id(parameter) for parameter in new_parameters}
+    backbone = [parameter for parameter in model.segformer.parameters() if id(parameter) not in new_ids]
+    decoder_and_branch = list(model.decode_head.parameters()) + new_parameters
+    return [{"params": backbone, "lr": config["encoder_lr"]},
+            {"params": decoder_and_branch, "lr": config["decoder_lr"]}]
 
 
 def _uses_decoder_redesign(architecture: dict) -> bool:
@@ -104,7 +128,7 @@ def _uses_custom_decoder(architecture: dict) -> bool:
 
 def _attach_architecture(model, architecture: dict) -> None:
     # Retain the schema-2 metadata key so old A/B checkpoints remain readable.
-    # It now describes all optional decoder and refinement switches.
+    # It now describes optional encoder, decoder and refinement switches.
     model.config.local_refinement = copy.deepcopy(architecture)
     if _uses_custom_decoder(architecture):
         with torch.random.fork_rng(devices=[]):
@@ -114,10 +138,14 @@ def _attach_architecture(model, architecture: dict) -> None:
         # initialization and the outer CPU/CUDA training RNG are retained.
         with torch.random.fork_rng(devices=[]):
             model.decode_head = RefinedDecodeHead(model.decode_head, model.config, architecture)
+    if architecture["encoder_discrimination"]:
+        with torch.random.fork_rng(devices=[]):
+            model.segformer.encoder = DiscriminativeEncoder(model.segformer.encoder, model.config, architecture)
 
 
 def _new_model(model_config: SegformerConfig, architecture: dict) -> SegformerForSemanticSegmentation:
-    model_class = (DecoderSegformerForSemanticSegmentation if _uses_custom_decoder(architecture)
+    model_class = (DiscriminationSegformerForSemanticSegmentation if architecture["encoder_discrimination"]
+                   else DecoderSegformerForSemanticSegmentation if _uses_custom_decoder(architecture)
                    else SegformerForSemanticSegmentation)
     return model_class(model_config)
 
@@ -164,9 +192,11 @@ def build_model(config: dict) -> SegformerForSemanticSegmentation:
     model.load_state_dict(target_state)
     _attach_architecture(model, architecture)
     logging.getLogger("segformer").info(
-        "Loaded %s encoder tensors from %s; input=%s; decoder=%s/%s; freqfusion=%s. Decoder initialized randomly.",
+        "Loaded %s encoder tensors from %s; input=%s; decoder=%s/%s; freqfusion=%s; "
+        "encoder_discrimination=%s/%s. Decoder and optional new branch initialized randomly.",
         len(copied), config["pretrained_model"], config["input_bands"],
         architecture["decoder_fusion"], architecture["decoder_upsampling"], architecture["freqfusion"],
+        architecture["encoder_discrimination"], architecture["discrimination_mode"],
     )
     return model
 

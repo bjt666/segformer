@@ -27,6 +27,9 @@ DEFAULTS: dict[str, Any] = {
     "freqfusion_lowpass_kernel": 5, "freqfusion_highpass_kernel": 3,
     "freqfusion_resample_groups": 4, "freqfusion_checkpoint": True,
     "freqfusion_chunk_size": 32,
+    "encoder_discrimination": False, "discrimination_mode": "feedback",
+    "discrimination_channels": 32, "discrimination_temperature": 0.2,
+    "discrimination_aux_weight": 0.2,
 }
 
 
@@ -61,11 +64,23 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("weight_decay must be nonnegative.")
     if type(config["pretrained"]) is not bool:
         raise ValueError("pretrained must be true or false.")
-    for key in ("module_a", "module_b", "freqfusion", "freqfusion_checkpoint"):
+    for key in ("module_a", "module_b", "freqfusion", "freqfusion_checkpoint", "encoder_discrimination"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be true or false.")
     if config["module_b"] and not config["module_a"]:
         raise ValueError("module_b selects module_a branches and requires module_a: true.")
+    if config["discrimination_mode"] not in ("feedback", "auxiliary"):
+        raise ValueError("discrimination_mode must be feedback or auxiliary.")
+    if type(config["discrimination_channels"]) is not int or config["discrimination_channels"] < 2:
+        raise ValueError("discrimination_channels must be an integer of at least two.")
+    temperature = config["discrimination_temperature"]
+    if type(temperature) not in (int, float) or not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("discrimination_temperature must be finite and positive.")
+    auxiliary_weight = config["discrimination_aux_weight"]
+    if type(auxiliary_weight) not in (int, float) or not math.isfinite(auxiliary_weight) or auxiliary_weight < 0:
+        raise ValueError("discrimination_aux_weight must be finite and nonnegative.")
+    if config["encoder_discrimination"] and config["discrimination_mode"] == "auxiliary" and auxiliary_weight == 0:
+        raise ValueError("Auxiliary-only discrimination requires discrimination_aux_weight > 0.")
     if config["decoder_fusion"] not in ("mlp", "progressive"):
         raise ValueError("decoder_fusion must be mlp or progressive.")
     if config["decoder_upsampling"] not in ("bilinear", "learned"):

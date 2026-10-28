@@ -23,6 +23,7 @@ from segformer_baseline.engine import evaluate_model, train_epoch
 from segformer_baseline.model import (
     architecture_from_config, build_model, checkpoint_architecture,
     checkpoint_model_signature, model_architecture, model_from_checkpoint, model_parameter_counts,
+    optimizer_parameter_groups,
 )
 from segformer_baseline.utils import (
     collect_environment, resolve_device, save_pip_freeze, seed_worker, set_seed,
@@ -90,6 +91,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant = f"decoder-{config['decoder_fusion']}-{config['decoder_upsampling']}"
         if config["freqfusion"]:
             variant = "freqfusion" if variant == "baseline" else f"{variant}-freqfusion"
+        if config["encoder_discrimination"]:
+            variant += f"-discrimination-{config['discrimination_mode']}"
         config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())
@@ -148,10 +151,12 @@ def main() -> None:
                "hidden_sizes": list(model.config.hidden_sizes),
                "decoder_hidden_size": model.config.decoder_hidden_size,
                "parameter_counts": parameter_counts})
-    optimizer = torch.optim.AdamW([
-        {"params": model.segformer.parameters(), "lr": config["encoder_lr"]},
-        {"params": model.decode_head.parameters(), "lr": config["decoder_lr"]},
-    ], weight_decay=config["weight_decay"])
+    optimizer = torch.optim.AdamW(optimizer_parameter_groups(model, config), weight_decay=config["weight_decay"])
+    if config["encoder_discrimination"]:
+        logger.info("Encoder discrimination mode=%s | main CE + %.3g * coarse CE | "
+                    "new branch uses decoder lr %.3g; pretrained backbone lr %.3g",
+                    config["discrimination_mode"], config["discrimination_aux_weight"],
+                    config["decoder_lr"], config["encoder_lr"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
     criterion = nn.CrossEntropyLoss()
     history = checkpoint["history"].copy() if checkpoint else []
@@ -232,6 +237,10 @@ def main() -> None:
                "train_seconds": train_result["seconds"], "val_seconds": val_result["seconds"],
                "epoch_seconds": time.monotonic() - epoch_started,
                "best_epoch": best_epoch, "best_foreground_iou": best_iou}
+        if config["encoder_discrimination"]:
+            row.update({"train_main_loss": train_result["main_loss"],
+                        "train_aux_loss": train_result["auxiliary_loss"],
+                        "train_aux_weight": config["discrimination_aux_weight"]})
         history.append(row)
         payload = make_checkpoint(model, optimizer, scheduler, epoch, best_iou, best_epoch,
                                   config, mean, std, history, manifest, generators, environment)

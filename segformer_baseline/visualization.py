@@ -77,8 +77,12 @@ def plot_history(history: list[dict], output_dir: Path) -> None:
         return
     output_dir.mkdir(parents=True, exist_ok=True)
     epochs = [row["epoch"] for row in history]
+    losses = [("train_loss", "Training"), ("val_loss", "Validation")]
+    if any("train_main_loss" in row for row in history):
+        losses = [("train_loss", "Training total"), ("train_main_loss", "Training main CE"),
+                  ("train_aux_loss", "Training coarse CE (unweighted)"), ("val_loss", "Validation main CE")]
     for filename, series, ylabel in (
-        ("loss.png", [("train_loss", "Training"), ("val_loss", "Validation")], "Cross entropy"),
+        ("loss.png", losses, "Loss"),
         ("metrics.png", [("val_foreground_iou", "Foreground IoU"), ("val_miou", "mIoU"),
                          ("val_dice", "Foreground Dice")], "Validation metric"),
         ("learning_rate.png", [("encoder_lr", "Encoder"), ("decoder_lr", "Decoder")], "Learning rate"),

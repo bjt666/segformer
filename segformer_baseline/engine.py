@@ -22,25 +22,47 @@ def resized_logits(model, images: torch.Tensor, size: tuple[int, int]) -> torch.
     return F.interpolate(logits, size=size, mode="bilinear", align_corners=False)
 
 
+def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion) -> dict:
+    """Final-head CE plus optional coarse-F2 CE, without caching forward tensors."""
+    outputs = model(pixel_values=images)
+    logits = outputs.logits
+    if logits.shape[-2:] != masks.shape[-2:]:
+        logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+    main_loss = criterion(logits, masks)
+    auxiliary_logits = getattr(outputs, "auxiliary_logits", None)
+    auxiliary_loss = main_loss.new_zeros(())
+    weight = 0.0
+    if auxiliary_logits is not None:
+        auxiliary_logits = F.interpolate(auxiliary_logits, size=masks.shape[-2:],
+                                         mode="bilinear", align_corners=False)
+        auxiliary_loss = criterion(auxiliary_logits, masks)
+        weight = model.config.local_refinement["discrimination_aux_weight"]
+    return {"loss": main_loss + weight * auxiliary_loss, "main_loss": main_loss,
+            "auxiliary_loss": auxiliary_loss, "auxiliary_weight": weight}
+
+
 def train_epoch(model, loader, optimizer, criterion, device: torch.device,
                 epoch: int, total_epochs: int, log_every: int) -> dict:
     logger = logging.getLogger("segformer")
     model.train()
     started = time.monotonic()
     total_loss = 0.0
+    total_main_loss, total_auxiliary_loss = 0.0, 0.0
     num_images = 0
     bar = tqdm(loader, desc=f"Train {epoch}/{total_epochs}", disable=not sys.stderr.isatty())
     for step, batch in enumerate(bar, start=1):
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        logits = resized_logits(model, images, masks.shape[-2:])
-        loss = criterion(logits, masks)
+        losses = training_losses(model, images, masks, criterion)
+        loss = losses["loss"]
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Nonfinite training loss at epoch {epoch}, batch {step}.")
         loss.backward()
         optimizer.step()
         total_loss += loss.item() * images.size(0)
+        total_main_loss += losses["main_loss"].item() * images.size(0)
+        total_auxiliary_loss += losses["auxiliary_loss"].item() * images.size(0)
         num_images += images.size(0)
         bar.set_postfix(loss=f"{total_loss / num_images:.5f}", lr=f"{optimizer.param_groups[0]['lr']:.2g}")
         if step == 1 or step % log_every == 0 or step == len(loader):
@@ -49,7 +71,12 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
                 epoch, total_epochs, step, len(loader), total_loss / num_images,
                 optimizer.param_groups[0]["lr"], optimizer.param_groups[1]["lr"], time.monotonic() - started,
             )
-    return {"loss": total_loss / num_images, "seconds": time.monotonic() - started}
+            if losses["auxiliary_weight"]:
+                logger.info("Loss components | main CE %.6f | coarse CE %.6f | coarse weight %.3g",
+                            total_main_loss / num_images, total_auxiliary_loss / num_images,
+                            losses["auxiliary_weight"])
+    return {"loss": total_loss / num_images, "main_loss": total_main_loss / num_images,
+            "auxiliary_loss": total_auxiliary_loss / num_images, "seconds": time.monotonic() - started}
 
 
 @torch.inference_mode()

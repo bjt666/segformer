@@ -1,0 +1,46 @@
+# GF source order: B, G, R, NIR. Independent encoder branch, original decoder.
+data_root: dataset
+output_dir: null
+epochs: 100
+batch_size: 8
+num_workers: 4
+seed: 42
+device: cuda
+pretrained: true
+pretrained_model: nvidia/mit-b0
+input_channels: [3, 2, 1]
+input_bands: [NIR, R, G]
+encoder_lr: 0.00006
+decoder_lr: 0.0006
+weight_decay: 0.01
+loss: cross_entropy
+log_every: 20
+visualization_samples: 8
+
+module_a: false
+module_b: false
+local_kernels: [3, 5, 7]
+refinement_stages: [1, 2]
+gate_mode: deep_shallow
+gate_reduction: 4
+gate_init_probability: 0.3333333333333333
+residual_init_std: 0.001
+
+decoder_fusion: mlp
+decoder_upsampling: bilinear
+upsample_channels: [64, 32]
+freqfusion: false
+freqfusion_compressed_channels: 64
+freqfusion_lowpass_kernel: 5
+freqfusion_highpass_kernel: 3
+freqfusion_resample_groups: 4
+freqfusion_checkpoint: true
+freqfusion_chunk_size: 32
+
+# F2 correction is fed into stage 3 and used as the decoder F2 feature.
+# New branch uses decoder_lr; total loss = main CE + weight * coarse CE.
+encoder_discrimination: true
+discrimination_mode: feedback
+discrimination_channels: 32
+discrimination_temperature: 0.2
+discrimination_aux_weight: 0.2

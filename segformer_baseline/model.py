@@ -11,6 +11,7 @@ from transformers import SegformerConfig, SegformerForImageClassification, Segfo
 from .config import DEFAULTS, default_config, validate_config
 from .decoder import DecoderHead, DecoderSegformerForSemanticSegmentation
 from .discrimination import DiscriminativeEncoder, DiscriminationSegformerForSemanticSegmentation
+from .hybrid import DualEncoder, DualSegformerForSemanticSegmentation, HighResolutionFusion
 from .refinement import RefinedDecodeHead
 
 
@@ -23,6 +24,8 @@ ARCHITECTURE_FIELDS = (
     "freqfusion_chunk_size",
     "encoder_discrimination", "discrimination_mode", "discrimination_channels",
     "discrimination_temperature", "discrimination_aux_weight",
+    "dual_encoder", "dual_interaction", "dual_highres", "dual_highres_channels",
+    "dual_highres_blocks", "dual_residual_scale",
 )
 
 
@@ -76,6 +79,14 @@ def model_parameter_counts(model) -> dict:
     """Parameter counts only; no FLOPs or timing estimates are inferred."""
     count = lambda module: sum(parameter.numel() for parameter in module.parameters())
     encoder = count(model.segformer)
+    dual = model.segformer.encoder if isinstance(model.segformer.encoder, DualEncoder) else None
+    cnn = count(dual.cnn) if dual is not None else 0
+    exchange = count(dual.exchanges) if dual is not None else 0
+    highres = count(dual.high_resolution_branch) if dual is not None and hasattr(dual, "high_resolution_branch") else 0
+    recovery = getattr(model.decode_head, "learned_upsampling", None)
+    highres_fusion = count(recovery.high_resolution_fusion) if (
+        recovery is not None and hasattr(recovery, "high_resolution_fusion")
+    ) else 0
     discrimination = count(model.segformer.encoder.discrimination) if (
         isinstance(model.segformer.encoder, DiscriminativeEncoder)
     ) else 0
@@ -92,11 +103,14 @@ def model_parameter_counts(model) -> dict:
             original_decoder, redesign = decoder - freqfusion, 0
         else:
             # Replacement head, excluding the separately reported FF modules.
-            original_decoder, redesign = 0, decoder - freqfusion
+            original_decoder, redesign = 0, decoder - freqfusion - highres_fusion
     else:
         original_decoder, refinement, redesign = decoder, 0, 0
     return {"total": count(model), "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            "encoder": encoder, "encoder_backbone": encoder - discrimination,
+            "encoder": encoder, "encoder_backbone": encoder - discrimination - exchange - highres,
+            "mit_encoder": encoder - discrimination - cnn - exchange - highres,
+            "cnn_encoder": cnn, "cross_interaction": exchange,
+            "high_resolution_branch": highres, "high_resolution_fusion": highres_fusion,
             "encoder_discrimination": discrimination,
             "decoder": decoder, "original_decoder": original_decoder,
             "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion}
@@ -111,6 +125,8 @@ def optimizer_parameter_groups(model, config: dict) -> list[dict]:
     branch = (model.segformer.encoder.discrimination
               if isinstance(model.segformer.encoder, DiscriminativeEncoder) else None)
     new_parameters = list(branch.parameters()) if branch is not None else []
+    if isinstance(model.segformer.encoder, DualEncoder):
+        new_parameters.extend(model.segformer.encoder.new_parameters())
     new_ids = {id(parameter) for parameter in new_parameters}
     backbone = [parameter for parameter in model.segformer.parameters() if id(parameter) not in new_ids]
     decoder_and_branch = list(model.decode_head.parameters()) + new_parameters
@@ -141,10 +157,20 @@ def _attach_architecture(model, architecture: dict) -> None:
     if architecture["encoder_discrimination"]:
         with torch.random.fork_rng(devices=[]):
             model.segformer.encoder = DiscriminativeEncoder(model.segformer.encoder, model.config, architecture)
+    if architecture["dual_encoder"]:
+        with torch.random.fork_rng(devices=[]):
+            model.segformer.encoder = DualEncoder(model.segformer.encoder, model.config, architecture)
+        if architecture["dual_highres"]:
+            with torch.random.fork_rng(devices=[]):
+                model.decode_head.learned_upsampling.high_resolution_fusion = HighResolutionFusion(
+                    architecture["upsample_channels"][0], architecture["dual_highres_channels"],
+                    architecture["dual_residual_scale"],
+                )
 
 
 def _new_model(model_config: SegformerConfig, architecture: dict) -> SegformerForSemanticSegmentation:
-    model_class = (DiscriminationSegformerForSemanticSegmentation if architecture["encoder_discrimination"]
+    model_class = (DualSegformerForSemanticSegmentation if architecture["dual_encoder"]
+                   else DiscriminationSegformerForSemanticSegmentation if architecture["encoder_discrimination"]
                    else DecoderSegformerForSemanticSegmentation if _uses_custom_decoder(architecture)
                    else SegformerForSemanticSegmentation)
     return model_class(model_config)
@@ -191,6 +217,8 @@ def build_model(config: dict) -> SegformerForSemanticSegmentation:
         raise ValueError(f"Incomplete pretrained encoder: {sorted(missing)[:5]}")
     model.load_state_dict(target_state)
     _attach_architecture(model, architecture)
+    if architecture["dual_encoder"]:
+        model.segformer.encoder.cnn.load_pretrained(config["cnn_pretrained_model"], channels)
     logging.getLogger("segformer").info(
         "Loaded %s encoder tensors from %s; input=%s; decoder=%s/%s; freqfusion=%s; "
         "encoder_discrimination=%s/%s. Decoder and optional new branch initialized randomly.",

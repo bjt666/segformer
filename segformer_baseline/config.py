@@ -30,6 +30,9 @@ DEFAULTS: dict[str, Any] = {
     "encoder_discrimination": False, "discrimination_mode": "feedback",
     "discrimination_channels": 32, "discrimination_temperature": 0.2,
     "discrimination_aux_weight": 0.2,
+    "dual_encoder": False, "dual_interaction": True, "dual_highres": True,
+    "dual_highres_channels": 64, "dual_highres_blocks": 3,
+    "dual_residual_scale": 0.1, "cnn_pretrained_model": "imagenet1k_v2",
 }
 
 
@@ -64,11 +67,23 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("weight_decay must be nonnegative.")
     if type(config["pretrained"]) is not bool:
         raise ValueError("pretrained must be true or false.")
-    for key in ("module_a", "module_b", "freqfusion", "freqfusion_checkpoint", "encoder_discrimination"):
+    for key in ("module_a", "module_b", "freqfusion", "freqfusion_checkpoint", "encoder_discrimination",
+                "dual_encoder", "dual_interaction", "dual_highres"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be true or false.")
     if config["module_b"] and not config["module_a"]:
         raise ValueError("module_b selects module_a branches and requires module_a: true.")
+    for key in ("dual_highres_channels", "dual_highres_blocks"):
+        if type(config[key]) is not int or config[key] < 1:
+            raise ValueError(f"{key} must be a positive integer.")
+    scale = config["dual_residual_scale"]
+    if type(scale) not in (int, float) or not math.isfinite(scale) or not 0 < scale <= 1:
+        raise ValueError("dual_residual_scale must be finite and in (0, 1].")
+    if config["dual_encoder"]:
+        if config["module_a"] or config["module_b"] or config["encoder_discrimination"]:
+            raise ValueError("Dual encoder experiments require legacy A/B and encoder_discrimination OFF.")
+        if config["decoder_fusion"] != "progressive" or config["decoder_upsampling"] != "learned":
+            raise ValueError("Dual encoder requires progressive fusion and learned upsampling.")
     if config["discrimination_mode"] not in ("feedback", "auxiliary"):
         raise ValueError("discrimination_mode must be feedback or auxiliary.")
     if type(config["discrimination_channels"]) is not int or config["discrimination_channels"] < 2:
@@ -128,7 +143,7 @@ def validate_config(config: dict[str, Any]) -> None:
     initial_std = config["residual_init_std"]
     if type(initial_std) not in (int, float) or not math.isfinite(initial_std) or initial_std < 0:
         raise ValueError("residual_init_std must be finite and nonnegative.")
-    for key in ("data_root", "device", "pretrained_model"):
+    for key in ("data_root", "device", "pretrained_model", "cnn_pretrained_model"):
         if not isinstance(config[key], str) or not config[key]:
             raise ValueError(f"{key} must be a nonempty string.")
     if config["output_dir"] is not None and (not isinstance(config["output_dir"], str) or not config["output_dir"]):

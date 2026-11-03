@@ -76,7 +76,8 @@ class _LearnedUpsampling(nn.Module):
         self.refine_full = _ConvBnRelu(channels[1])
 
     def forward(
-        self, features: torch.Tensor, input_size: tuple[int, int] | torch.Size
+        self, features: torch.Tensor, input_size: tuple[int, int] | torch.Size,
+        high_resolution_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         height, width = input_size
         features = self.reduce_half(features)
@@ -87,6 +88,12 @@ class _LearnedUpsampling(nn.Module):
             align_corners=False,
         )
         features = self.refine_half(features)
+        if hasattr(self, "high_resolution_fusion"):
+            if high_resolution_features is None:
+                raise ValueError("The hybrid decoder requires its saved high-resolution encoder features.")
+            features = self.high_resolution_fusion(features, high_resolution_features)
+        elif high_resolution_features is not None:
+            raise ValueError("High-resolution features were passed to a decoder without the fusion module.")
         features = self.reduce_full(features)
         features = F.interpolate(
             features, size=input_size, mode="bilinear", align_corners=False
@@ -188,6 +195,7 @@ class DecoderHead(nn.Module):
         self,
         encoder_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor],
         input_size: tuple[int, int] | torch.Size | None = None,
+        high_resolution_features: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if len(encoder_hidden_states) != 4:
             raise ValueError("DecoderHead requires exactly four encoder feature stages.")
@@ -240,7 +248,7 @@ class DecoderHead(nn.Module):
             )
 
         if self.upsampling == "learned":
-            features = self.learned_upsampling(features, input_size)
+            features = self.learned_upsampling(features, input_size, high_resolution_features)
         return self.classifier(self.dropout(features))
 
 

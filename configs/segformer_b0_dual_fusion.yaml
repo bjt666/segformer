@@ -1,0 +1,38 @@
+# Same two ImageNet encoders, decoder fusion only; no feedback/high-res path.
+data_root: dataset
+output_dir: null
+epochs: 100
+batch_size: 8
+num_workers: 4
+seed: 42
+device: cuda
+pretrained: true
+pretrained_model: nvidia/mit-b0
+cnn_pretrained_model: imagenet1k_v2
+input_channels: [3, 2, 1]
+input_bands: [NIR, R, G]
+encoder_lr: 0.00006
+decoder_lr: 0.0006
+weight_decay: 0.01
+loss: cross_entropy
+log_every: 20
+visualization_samples: 8
+module_a: false
+module_b: false
+encoder_discrimination: false
+decoder_fusion: progressive
+decoder_upsampling: learned
+upsample_channels: [64, 32]
+freqfusion: true
+freqfusion_compressed_channels: 64
+freqfusion_lowpass_kernel: 5
+freqfusion_highpass_kernel: 3
+freqfusion_resample_groups: 4
+freqfusion_checkpoint: true
+freqfusion_chunk_size: 32
+dual_encoder: true
+dual_interaction: false
+dual_highres: false
+dual_highres_channels: 64
+dual_highres_blocks: 3
+dual_residual_scale: 0.1

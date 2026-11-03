@@ -1,6 +1,6 @@
 # GF 假彩色输入的 SegFormer 基线与结构消融
 
-用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion、编码器前景／背景判别分支及其组合实验；旧 A/B 实验保留用于复现。
+用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion、MiT/ResNet-50 双编码器及高分辨率恢复、前景／背景判别分支；旧实验保留用于复现。
 
 ## 基线设置
 
@@ -14,6 +14,86 @@
 - 验证集的**前景 IoU**用于选择最佳模型。测试集不参与训练或选模。
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
+
+## 完整双编码器：MiT-B0＋ResNet-50
+
+本轮主配置为 `configs/segformer_b0_dual_full.yaml`。同一幅 NIR/R/G 图像进入 MiT-B0 与完整 ResNet-50。两路各输出 1/4、1/8、1/16、1/32 尺度特征，在每一级进行交互；ResNet 输入层另分出 1/2 尺度特征，经过三个空间残差卷积块持续处理，在解码恢复到半尺寸时参与最终融合。旧 A/B 和前景／背景判别分支均关闭，训练只有最终分割头的交叉熵。
+
+**逐级交互的实际顺序：**同一级原始 MiT/CNN 特征先投影、生成位置与通道相关门控，分别计算两路修正量，再同时残差更新。修正后的两路进入各自下一阶段。每一级另将更新后的 CNN 特征投影到 MiT 通道数，与更新后的 MiT 特征融合，交给现有渐进解码器和 FreqFusion；因此四个 CNN 阶段都有实际输出用途，包括最后一级。这是无循环的前向计算。残差缩放系数可学习，初值为 `0.1`，不是零初始化的旧原型分支。
+
+**半尺寸通路：**从 ResNet stem 分出真实的 1/2 尺度特征，经持续卷积处理；解码器先恢复到实际输入的半尺寸，再通过语义引导门控、拼接和卷积与此通路融合，最后继续原全尺寸恢复与分类。没有对输入做超分辨率，也不引入额外波段。
+
+默认宽度下完整参数量 **33,736,920**：MiT 3,319,392、ResNet-50 23,508,032、逐级交互/融合 4,314,880、半尺寸卷积分支 226,176、半尺寸融合 86,400、原解码改造 1,967,970、FreqFusion 314,070。完整版本约为原组合 5,601,432 参数的 6.02 倍；参数增加不等于已经证明指标提升或方法创新。
+
+ResNet-50 使用标准 `[3,4,6,3]` bottleneck，遵循 TorchVision v1.5 的 stride 位置，移除分类 FC，支持官方 ImageNet-1K V2 state-dict；实现只依赖 PyTorch，不需要新增 torchvision/MMCV。两路都使用 ImageNet 预训练，首层均按当前 NIR/R/G 规则适配。两个预训练主干使用 `encoder_lr`，交互层、高分辨率通路和解码器使用 `decoder_lr`。`--no-pretrained` 会将两路都随机初始化。新增 CNN 也带来额外预训练表示，不能把全部收益直接归因于交互机制。
+
+| 配置 | 四级编码反馈 | 半尺寸通路 | 用途 |
+| --- | --- | --- | --- |
+| `segformer_b0_decoder_freqfusion.yaml` | 无 CNN | 无 | 已有直接对照 |
+| `segformer_b0_dual_fusion.yaml` | 关闭 | 关闭 | 两个独立编码器的四尺度融合对照 |
+| `segformer_b0_dual_interaction.yaml` | 开启 | 关闭 | 检验逐级反馈作用 |
+| `segformer_b0_dual_full.yaml` | 开启 | 开启 | 本轮完整主实验 |
+
+开关分别为 `dual_encoder`、`dual_interaction`、`dual_highres`。只有关闭 `dual_encoder` 才恢复单编码器；其余两个字段只控制双编码器内部组件。`dual_highres_channels: 64`、`dual_highres_blocks: 3` 决定高分辨率分支宽度与块数，`dual_residual_scale: 0.1` 是交互/融合的可学习残差缩放初值。双编码器要求 `decoder_fusion: progressive`、`decoder_upsampling: learned`；FreqFusion 仍可单独开关。所有结构设置随检查点保存，已有检查点不能通过修改配置改变结构后续训。
+
+### AutoDL 更新、准备权重与训练
+
+```bash
+cd /root/segformer
+source /etc/network_turbo
+git pull --ff-only
+```
+
+项目依赖没有增加，沿用原来的 PyTorch 2.1.2 / CUDA 11.8 镜像即可。MiT 权重通常已在之前训练时缓存；ResNet-50 权重是新增下载。先联网保存到系统盘：
+
+```bash
+python download_pretrained.py --cnn-only --output-dir /root/models
+```
+
+下载脚本使用官方 `download.pytorch.org` URL 并校验 SHA256，生成 `/root/models/resnet50_imagenet1k_v2.pth` 与来源记录。如果也需要保存完整本地 MiT，去掉 `--cnn-only`，会额外生成 `/root/models/mit-b0/`。若服务器下载失败，也可在本地运行脚本的 CNN-only 模式，再上传同名权重文件。
+
+先检查服务器上 batch size 8 的单批训练显存；此命令默认随机初始化、不下载权重、不写训练结果，也不验证分割精度：
+
+```bash
+python check_model.py --config configs/segformer_b0_dual_full.yaml
+```
+
+检查包含前向、反向和 AdamW 第一步，打印参数量、损失和 CUDA 峰值显存。这里不会冻结任一主干。不同 GPU、CUDA/cuDNN 环境的峰值可能不同；如果显存不足，先用 `--batch-size 4` 检查，并对对应对照实验采用相同 batch 设置，不能把不同训练设置的变化都归为结构收益。
+
+已有完整 MiT 缓存后，使用本地 CNN 文件开始新的独立实验：
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python train.py \
+  --config configs/segformer_b0_dual_full.yaml \
+  --cnn-pretrained-model /root/models/resnet50_imagenet1k_v2.pth \
+  --output-dir outputs/gf16m_dual_full_s42
+```
+
+保持 100 轮、batch size 8、seed 42、NIR/R/G、现有学习率与数据划分。离线变量不会补齐缺失的 MiT 文件；已有本地 MiT 时追加 `--pretrained-model /root/models/mit-b0`。输出目录必须是新目录，不加载此前分割模型的 `best.pt` 来启动新结构。若需要 `batch_size 4`，在新训练命令追加 `--batch-size 4` 并使用体现该设置的新输出名。
+
+两组结构消融分别替换配置与输出目录独立训练，均保留相同的双 ImageNet 初始化：
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python train.py --config configs/segformer_b0_dual_fusion.yaml --cnn-pretrained-model /root/models/resnet50_imagenet1k_v2.pth --output-dir outputs/gf16m_dual_fusion_s42
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python train.py --config configs/segformer_b0_dual_interaction.yaml --cnn-pretrained-model /root/models/resnet50_imagenet1k_v2.pth --output-dir outputs/gf16m_dual_interaction_s42
+```
+
+中断后恢复完整实验自身的状态，不重新下载任一预训练编码器：
+
+```bash
+python train.py --resume outputs/gf16m_dual_full_s42/checkpoints/last.pt
+```
+
+训练期间用验证集选模。确定方案后，用保存的 `best.pt` 评估整个测试集和导出所有预测：
+
+```bash
+python evaluate.py --data-root dataset --checkpoint outputs/gf16m_dual_full_s42/checkpoints/best.pt --split test
+python predict.py --checkpoint outputs/gf16m_dual_full_s42/checkpoints/best.pt --input dataset/images/test --mask-dir dataset/masks/test
+```
+
+测试指标默认在 `outputs/gf16m_dual_full_s42/evaluation/test-时间戳/metrics.json`，全部预测在 `outputs/gf16m_dual_full_s42/predictions/时间戳/`。训练目录中的 `architecture.json` 和 `model_summary.json` 分别保存全部开关和分项参数量。数据集、权重和输出仍由 `.gitignore` 排除。
+
+双路表示与高分辨率分工可参考 [BiSeNet V2](https://link.springer.com/article/10.1007/s11263-021-01515-2)、[HRNet](https://arxiv.org/abs/1908.07919)；本实现属于研究性组合与适配，不声称复现原文、保证增益或已证实创新。实验有效后仍需补充同容量/同预训练条件的对照及多种子结果。
 
 ## 编码器前景／背景判别分支
 

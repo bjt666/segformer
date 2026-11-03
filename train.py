@@ -44,6 +44,7 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument("--" + field.replace("_", "-"), type=float)
     parser.add_argument("--device")
     parser.add_argument("--pretrained-model")
+    parser.add_argument("--cnn-pretrained-model", help="Local ResNet-50 RGB state-dict or imagenet1k_v2")
     parser.add_argument("--no-pretrained", dest="pretrained", action="store_false", default=None)
     return parser.parse_args()
 
@@ -93,6 +94,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant = "freqfusion" if variant == "baseline" else f"{variant}-freqfusion"
         if config["encoder_discrimination"]:
             variant += f"-discrimination-{config['discrimination_mode']}"
+        if config["dual_encoder"]:
+            variant += f"-dual-interaction{int(config['dual_interaction'])}-highres{int(config['dual_highres'])}"
         config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())
@@ -152,6 +155,10 @@ def main() -> None:
                "decoder_hidden_size": model.config.decoder_hidden_size,
                "parameter_counts": parameter_counts})
     optimizer = torch.optim.AdamW(optimizer_parameter_groups(model, config), weight_decay=config["weight_decay"])
+    if config["dual_encoder"]:
+        logger.info("Dual MiT/ResNet-50 | interaction=%s highres=%s | final-head CE only | "
+                    "both backbones lr %.3g; new modules and decoder lr %.3g",
+                    config["dual_interaction"], config["dual_highres"], config["encoder_lr"], config["decoder_lr"])
     if config["encoder_discrimination"]:
         logger.info("Encoder discrimination mode=%s | main CE + %.3g * coarse CE | "
                     "new branch uses decoder lr %.3g; pretrained backbone lr %.3g",

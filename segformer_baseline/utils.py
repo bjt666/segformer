@@ -117,6 +117,7 @@ def collect_environment(repo_root: Path, device: torch.device) -> dict:
         "cuda_device_count": torch.cuda.device_count(), "device": str(device),
         "cudnn_benchmark": torch.backends.cudnn.benchmark,
         "cudnn_deterministic": torch.backends.cudnn.deterministic,
+        "cuda_total_memory_bytes": torch.cuda.get_device_properties(device).total_memory if device.type == "cuda" else None,
         "git_commit": git("rev-parse", "HEAD"), "git_status": git("status", "--porcelain"),
     }
 

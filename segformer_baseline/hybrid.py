@@ -242,7 +242,8 @@ class DualSegformerForSemanticSegmentation(DecoderSegformerForSemanticSegmentati
         outputs = self.segformer.encoder(pixel_values, output_attentions=output_attentions,
                                          output_hidden_states=True, return_dict=True)
         logits = self.decode_head(outputs.hidden_states, input_size=pixel_values.shape[-2:],
-                                  high_resolution_features=outputs.high_resolution_features)
+                                  high_resolution_features=outputs.high_resolution_features,
+                                  pixel_values=pixel_values)
         loss = None
         if labels is not None:
             loss = F.cross_entropy(F.interpolate(logits, size=labels.shape[-2:], mode="bilinear", align_corners=False),

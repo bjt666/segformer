@@ -21,7 +21,7 @@ ARCHITECTURE_FIELDS = (
     "decoder_fusion", "decoder_upsampling", "upsample_channels",
     "freqfusion", "freqfusion_compressed_channels", "freqfusion_lowpass_kernel",
     "freqfusion_highpass_kernel", "freqfusion_resample_groups", "freqfusion_checkpoint",
-    "freqfusion_chunk_size",
+    "freqfusion_chunk_size", "spectral_refinement",
     "encoder_discrimination", "discrimination_mode", "discrimination_channels",
     "discrimination_temperature", "discrimination_aux_weight",
     "dual_encoder", "dual_interaction", "dual_highres", "dual_highres_channels",
@@ -36,6 +36,8 @@ def architecture_from_config(config: dict) -> dict:
     architecture = {key: copy.deepcopy(config.get(key, DEFAULTS[key])) for key in ARCHITECTURE_FIELDS}
     validation = default_config()
     validation.update(architecture)
+    if architecture["spectral_refinement"] != "off":
+        validation["input_channels"] = config.get("input_channels", validation["input_channels"])
     validate_config(validation)
     # Stage order does not change the computation or state-dict layout.
     architecture["refinement_stages"] = sorted(architecture["refinement_stages"])
@@ -94,6 +96,9 @@ def model_parameter_counts(model) -> dict:
     freqfusion = count(model.decode_head.freqfusion_blocks) if (
         isinstance(model.decode_head, DecoderHead) and model.decode_head.freqfusion
     ) else 0
+    spectral_refinement = count(model.decode_head.spectral_refinement) if (
+        hasattr(model.decode_head, "spectral_refinement")
+    ) else 0
     if isinstance(model.decode_head, RefinedDecodeHead):
         original_decoder = count(model.decode_head.original_head)
         refinement, redesign = decoder - original_decoder, 0
@@ -103,7 +108,7 @@ def model_parameter_counts(model) -> dict:
             original_decoder, redesign = decoder - freqfusion, 0
         else:
             # Replacement head, excluding the separately reported FF modules.
-            original_decoder, redesign = 0, decoder - freqfusion - highres_fusion
+            original_decoder, redesign = 0, decoder - freqfusion - highres_fusion - spectral_refinement
     else:
         original_decoder, refinement, redesign = decoder, 0, 0
     return {"total": count(model), "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
@@ -113,7 +118,8 @@ def model_parameter_counts(model) -> dict:
             "high_resolution_branch": highres, "high_resolution_fusion": highres_fusion,
             "encoder_discrimination": discrimination,
             "decoder": decoder, "original_decoder": original_decoder,
-            "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion}
+            "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion,
+            "spectral_refinement": spectral_refinement}
 
 
 def optimizer_parameter_groups(model, config: dict) -> list[dict]:

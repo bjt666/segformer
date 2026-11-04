@@ -10,6 +10,8 @@ from typing import Any
 import yaml
 
 
+SPECTRAL_REFINEMENT_MODES = ("off", "concat", "local")
+
 DEFAULTS: dict[str, Any] = {
     "data_root": "dataset", "output_dir": None, "epochs": 100,
     "batch_size": 8, "num_workers": 4, "seed": 42, "device": "cuda",
@@ -27,6 +29,7 @@ DEFAULTS: dict[str, Any] = {
     "freqfusion_lowpass_kernel": 5, "freqfusion_highpass_kernel": 3,
     "freqfusion_resample_groups": 4, "freqfusion_checkpoint": True,
     "freqfusion_chunk_size": 32,
+    "spectral_refinement": "off",
     "encoder_discrimination": False, "discrimination_mode": "feedback",
     "discrimination_channels": 32, "discrimination_temperature": 0.2,
     "discrimination_aux_weight": 0.2,
@@ -100,6 +103,13 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("decoder_fusion must be mlp or progressive.")
     if config["decoder_upsampling"] not in ("bilinear", "learned"):
         raise ValueError("decoder_upsampling must be bilinear or learned.")
+    if config["spectral_refinement"] not in SPECTRAL_REFINEMENT_MODES:
+        raise ValueError("spectral_refinement must be off, concat or local.")
+    if config["spectral_refinement"] != "off":
+        if config["decoder_upsampling"] != "learned":
+            raise ValueError("Spectral refinement requires decoder_upsampling: learned.")
+        if config["input_channels"] != [3, 2, 1]:
+            raise ValueError("Spectral refinement requires NIR/R/G input_channels: [3, 2, 1].")
     upsample_channels = config["upsample_channels"]
     if not isinstance(upsample_channels, list) or len(upsample_channels) != 2 or any(
         type(channels) is not int or channels < 1 for channels in upsample_channels

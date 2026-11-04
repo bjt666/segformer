@@ -166,7 +166,8 @@ class DiscriminationSegformerForSemanticSegmentation(DecoderSegformerForSemantic
             output_hidden_states=True, return_dict=True,
         )
         if isinstance(self.decode_head, DecoderHead):
-            logits = self.decode_head(outputs.hidden_states, input_size=pixel_values.shape[-2:])
+            logits = self.decode_head(outputs.hidden_states, input_size=pixel_values.shape[-2:],
+                                      pixel_values=pixel_values)
         else:
             logits = self.decode_head(outputs.hidden_states)
         loss = None

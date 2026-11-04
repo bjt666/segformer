@@ -101,6 +101,49 @@ class _LearnedUpsampling(nn.Module):
         return self.refine_full(features)
 
 
+class _SpectralRefinement(nn.Module):
+    """Correct the foreground logit using full-resolution decoder and spectral cues."""
+
+    def __init__(self, channels: int, mode: str) -> None:
+        super().__init__()
+        self.mode = mode
+        width = 16
+        self.refine = nn.Sequential(
+            nn.Conv2d(channels + 3, width, kernel_size=1),
+            nn.ReLU(),
+            nn.Conv2d(width, width, kernel_size=3, padding=1, groups=width),
+            nn.ReLU(),
+            nn.Conv2d(width, 1, kernel_size=1),
+        )
+        nn.init.zeros_(self.refine[-1].weight)
+        nn.init.zeros_(self.refine[-1].bias)
+
+    @staticmethod
+    def _relative_bands(bands: torch.Tensor, foreground: torch.Tensor) -> torch.Tensor:
+        # Estimate nearby water from the initial prediction, excluding the center
+        # pixel. Squaring the background probability favors reliable references.
+        water = (1 - foreground.detach()).square()
+        values = torch.cat((bands * water, water), dim=1)
+        vertical = F.avg_pool2d(values, (31, 1), stride=1, padding=(15, 0), divisor_override=1)
+        neighbors = F.avg_pool2d(vertical, (1, 31), stride=1, padding=(0, 15), divisor_override=1)
+        neighbors = neighbors - values
+        support = neighbors[:, 2:3]
+        reference = neighbors[:, :2] / support.clamp_min(1.0)
+        # Below one pixel's worth of background weight, use no spectral offset.
+        return torch.where(support >= 1.0, bands - reference, 0.0)
+
+    def forward(
+        self, features: torch.Tensor, logits: torch.Tensor, pixel_values: torch.Tensor
+    ) -> torch.Tensor:
+        bands = pixel_values[:, :2].float()
+        foreground = (logits[:, 1:2].float() - logits[:, :1].float()).sigmoid()
+        if self.mode == "local":
+            bands = self._relative_bands(bands, foreground)
+        cues = torch.cat((bands, foreground), dim=1).to(features.dtype)
+        correction = self.refine(torch.cat((features, cues), dim=1))
+        return torch.cat((logits[:, :1], logits[:, 1:2] + correction), dim=1)
+
+
 class DecoderHead(nn.Module):
     """Reuse the original stage projections with selectable decoder modules.
 
@@ -117,6 +160,7 @@ class DecoderHead(nn.Module):
     Optional FreqFusion changes the cross-scale alignment of either fusion
     pathway. In MLP mode it recursively aligns and concatenates all projected
     branches, retaining the original final fusion and classifier layers.
+    Optional spectral refinement corrects full-resolution foreground logits.
     Fusion width is always ``model_config.decoder_hidden_size``.
     """
 
@@ -191,11 +235,19 @@ class DecoderHead(nn.Module):
                     ) for index, stage in enumerate(("f3", "f2", "f1"))
                 })
 
+        spectral_mode = architecture.get("spectral_refinement", "off")
+        if spectral_mode != "off":
+            if self.upsampling != "learned" or model_config.num_labels != 2 or model_config.num_channels != 3:
+                raise ValueError("Spectral refinement requires learned upsampling, NIR/R/G and two classes.")
+            self.spectral_refinement = _SpectralRefinement(channels[-1], spectral_mode)
+
     def forward(
         self,
         encoder_hidden_states: tuple[torch.Tensor, ...] | list[torch.Tensor],
         input_size: tuple[int, int] | torch.Size | None = None,
         high_resolution_features: torch.Tensor | None = None,
+        *,
+        pixel_values: torch.Tensor | None = None,
     ) -> torch.Tensor:
         if len(encoder_hidden_states) != 4:
             raise ValueError("DecoderHead requires exactly four encoder feature stages.")
@@ -249,7 +301,12 @@ class DecoderHead(nn.Module):
 
         if self.upsampling == "learned":
             features = self.learned_upsampling(features, input_size, high_resolution_features)
-        return self.classifier(self.dropout(features))
+        logits = self.classifier(self.dropout(features))
+        if hasattr(self, "spectral_refinement"):
+            if pixel_values is None:
+                raise ValueError("Spectral refinement requires full-resolution input pixels.")
+            logits = self.spectral_refinement(features, logits, pixel_values)
+        return logits
 
 
 class DecoderSegformerForSemanticSegmentation(SegformerForSemanticSegmentation):
@@ -296,7 +353,8 @@ class DecoderSegformerForSemanticSegmentation(SegformerForSemanticSegmentation):
             output_hidden_states=True,
             return_dict=True,
         )
-        logits = self.decode_head(outputs.hidden_states, input_size=pixel_values.shape[-2:])
+        logits = self.decode_head(outputs.hidden_states, input_size=pixel_values.shape[-2:],
+                                  pixel_values=pixel_values)
         loss = None
         if labels is not None:
             loss_logits = F.interpolate(

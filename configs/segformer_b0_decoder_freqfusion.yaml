@@ -41,3 +41,6 @@ freqfusion_highpass_kernel: 3
 freqfusion_resample_groups: 4
 freqfusion_checkpoint: true
 freqfusion_chunk_size: 32
+
+# off: existing decoder; concat: direct NIR/R; local: neighborhood-relative NIR/R.
+spectral_refinement: "off"

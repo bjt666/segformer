@@ -17,7 +17,9 @@ from segformer_baseline.checkpoint import (
     SCHEMA_VERSION, atomic_torch_save, load_checkpoint, make_checkpoint,
     preprocessing_from_checkpoint, restore_rng,
 )
-from segformer_baseline.config import DEFAULTS, default_config, read_config, save_config, validate_config
+from segformer_baseline.config import (
+    DEFAULTS, SPECTRAL_REFINEMENT_MODES, default_config, read_config, save_config, validate_config,
+)
 from segformer_baseline.dataset import PairedTiffDataset, build_manifest, compute_train_stats
 from segformer_baseline.engine import evaluate_model, train_epoch
 from segformer_baseline.model import (
@@ -45,6 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device")
     parser.add_argument("--pretrained-model")
     parser.add_argument("--cnn-pretrained-model", help="Local ResNet-50 RGB state-dict or imagenet1k_v2")
+    parser.add_argument("--spectral-refinement", choices=SPECTRAL_REFINEMENT_MODES,
+                        help="Override the YAML spectral refinement mode")
     parser.add_argument("--no-pretrained", dest="pretrained", action="store_false", default=None)
     return parser.parse_args()
 
@@ -92,6 +96,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant = f"decoder-{config['decoder_fusion']}-{config['decoder_upsampling']}"
         if config["freqfusion"]:
             variant = "freqfusion" if variant == "baseline" else f"{variant}-freqfusion"
+        if config["spectral_refinement"] != "off":
+            variant += f"-spectral-{config['spectral_refinement']}"
         if config["encoder_discrimination"]:
             variant += f"-discrimination-{config['discrimination_mode']}"
         if config["dual_encoder"]:

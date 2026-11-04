@@ -18,8 +18,9 @@ from segformer_baseline.checkpoint import (
     preprocessing_from_checkpoint, restore_rng,
 )
 from segformer_baseline.config import (
-    DEFAULTS, SPECTRAL_REFINEMENT_MODES, default_config, read_config, save_config, validate_config,
+    DEFAULTS, SPECTRAL_REFINEMENT_MODES, TRAINING_LOSSES, default_config, read_config, save_config, validate_config,
 )
+from segformer_baseline.contrastive import HardAlgaeContrastiveLoss
 from segformer_baseline.dataset import PairedTiffDataset, build_manifest, compute_train_stats
 from segformer_baseline.engine import evaluate_model, train_epoch
 from segformer_baseline.model import (
@@ -49,6 +50,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--cnn-pretrained-model", help="Local ResNet-50 RGB state-dict or imagenet1k_v2")
     parser.add_argument("--spectral-refinement", choices=SPECTRAL_REFINEMENT_MODES,
                         help="Override the YAML spectral refinement mode")
+    parser.add_argument("--loss", choices=TRAINING_LOSSES, help="Override the YAML training loss")
     parser.add_argument("--no-pretrained", dest="pretrained", action="store_false", default=None)
     return parser.parse_args()
 
@@ -102,6 +104,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant += f"-discrimination-{config['discrimination_mode']}"
         if config["dual_encoder"]:
             variant += f"-dual-interaction{int(config['dual_interaction'])}-highres{int(config['dual_highres'])}"
+        if config["loss"] == "cross_entropy_contrastive":
+            variant += "-hard-algae-contrastive"
         config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())
@@ -172,6 +176,12 @@ def main() -> None:
                     config["decoder_lr"], config["encoder_lr"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
     criterion = nn.CrossEntropyLoss()
+    contrastive = None
+    if config["loss"] == "cross_entropy_contrastive":
+        contrastive = HardAlgaeContrastiveLoss(config)
+        logger.info("Hard algae contrastive loss | CE warmup %s epochs | weight %.3g | temperature %.3g | "
+                    "max samples per group %s", config["contrastive_warmup_epochs"], config["contrastive_weight"],
+                    config["contrastive_temperature"], config["contrastive_samples"])
     history = checkpoint["history"].copy() if checkpoint else []
     best_iou = checkpoint["best_iou"] if checkpoint else -1.0
     best_epoch = checkpoint["best_epoch"] if checkpoint else 0
@@ -229,8 +239,12 @@ def main() -> None:
     for epoch in range(start_epoch, config["epochs"] + 1):
         epoch_started = time.monotonic()
         encoder_lr, decoder_lr = (group["lr"] for group in optimizer.param_groups)
+        contrastive_weight = 0.0
+        if contrastive is not None and epoch > config["contrastive_warmup_epochs"]:
+            contrastive_weight = config["contrastive_weight"]
         train_result = train_epoch(model, train_loader, optimizer, criterion, device,
-                                   epoch, config["epochs"], config["log_every"])
+                                   epoch, config["epochs"], config["log_every"], contrastive=contrastive,
+                                   contrastive_weight=contrastive_weight)
         val_result = evaluate_model(model, val_loader, device, criterion,
                                     description=f"Validation {epoch}/{config['epochs']}",
                                     log_every=config["log_every"], collect_per_image=False,
@@ -254,6 +268,11 @@ def main() -> None:
             row.update({"train_main_loss": train_result["main_loss"],
                         "train_aux_loss": train_result["auxiliary_loss"],
                         "train_aux_weight": config["discrimination_aux_weight"]})
+        if contrastive is not None:
+            row.update({"train_main_loss": train_result["main_loss"],
+                        "train_contrastive_loss": train_result["contrastive_loss"],
+                        "train_contrastive_weight": contrastive_weight,
+                        "train_contrastive_batches": train_result["contrastive_batches"]})
         history.append(row)
         payload = make_checkpoint(model, optimizer, scheduler, epoch, best_iou, best_epoch,
                                   config, mean, std, history, manifest, generators, environment)

@@ -16,6 +16,14 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from torch.nn import functional as F
+
+
+def box_sum(values: torch.Tensor, size: int) -> torch.Tensor:
+    """Sum an odd square neighborhood, treating pixels outside the image as zero."""
+    padding = size // 2
+    vertical = F.avg_pool2d(values, (size, 1), stride=1, padding=(padding, 0), divisor_override=1)
+    return F.avg_pool2d(vertical, (1, size), stride=1, padding=(0, padding), divisor_override=1)
 
 
 def utc_now() -> str:

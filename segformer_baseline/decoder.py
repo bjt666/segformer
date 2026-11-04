@@ -9,6 +9,7 @@ classifier, after optional learned feature upsampling.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -18,9 +19,15 @@ from transformers import SegformerForSemanticSegmentation
 from transformers.modeling_outputs import SemanticSegmenterOutput
 
 from .freqfusion import FreqFusion
+from .utils import box_sum
 
 if TYPE_CHECKING:
     from transformers import SegformerConfig
+
+
+@dataclass
+class DecoderFeatureOutput(SemanticSegmenterOutput):
+    decoder_features: torch.Tensor | None = None
 
 
 class _ConvBnRelu(nn.Module):
@@ -124,9 +131,7 @@ class _SpectralRefinement(nn.Module):
         # pixel. Squaring the background probability favors reliable references.
         water = (1 - foreground.detach()).square()
         values = torch.cat((bands * water, water), dim=1)
-        vertical = F.avg_pool2d(values, (31, 1), stride=1, padding=(15, 0), divisor_override=1)
-        neighbors = F.avg_pool2d(vertical, (1, 31), stride=1, padding=(0, 15), divisor_override=1)
-        neighbors = neighbors - values
+        neighbors = box_sum(values, 31) - values
         support = neighbors[:, 2:3]
         reference = neighbors[:, :2] / support.clamp_min(1.0)
         # Below one pixel's worth of background weight, use no spectral offset.
@@ -248,7 +253,8 @@ class DecoderHead(nn.Module):
         high_resolution_features: torch.Tensor | None = None,
         *,
         pixel_values: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+        return_features: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if len(encoder_hidden_states) != 4:
             raise ValueError("DecoderHead requires exactly four encoder feature stages.")
         if self.upsampling == "learned" and (
@@ -306,7 +312,7 @@ class DecoderHead(nn.Module):
             if pixel_values is None:
                 raise ValueError("Spectral refinement requires full-resolution input pixels.")
             logits = self.spectral_refinement(features, logits, pixel_values)
-        return logits
+        return (logits, features) if return_features else logits
 
 
 class DecoderSegformerForSemanticSegmentation(SegformerForSemanticSegmentation):
@@ -325,8 +331,12 @@ class DecoderSegformerForSemanticSegmentation(SegformerForSemanticSegmentation):
         output_attentions: bool | None = None,
         output_hidden_states: bool | None = None,
         return_dict: bool | None = None,
+        *,
+        return_decoder_features: bool = False,
     ) -> tuple | SemanticSegmenterOutput:
         if not isinstance(self.decode_head, DecoderHead):
+            if return_decoder_features:
+                raise ValueError("Returning decoder features requires DecoderHead.")
             return super().forward(
                 pixel_values=pixel_values,
                 labels=labels,
@@ -353,8 +363,12 @@ class DecoderSegformerForSemanticSegmentation(SegformerForSemanticSegmentation):
             output_hidden_states=True,
             return_dict=True,
         )
-        logits = self.decode_head(outputs.hidden_states, input_size=pixel_values.shape[-2:],
-                                  pixel_values=pixel_values)
+        decoded = self.decode_head(outputs.hidden_states, input_size=pixel_values.shape[-2:],
+                                    pixel_values=pixel_values, return_features=return_decoder_features)
+        if return_decoder_features:
+            logits, decoder_features = decoded
+        else:
+            logits = decoded
         loss = None
         if labels is not None:
             loss_logits = F.interpolate(
@@ -370,11 +384,16 @@ class DecoderSegformerForSemanticSegmentation(SegformerForSemanticSegmentation):
                 output += (outputs.hidden_states,)
             if outputs.attentions is not None:
                 output += (outputs.attentions,)
+            if return_decoder_features:
+                output += (decoder_features,)
             return (loss,) + output if loss is not None else output
 
-        return SemanticSegmenterOutput(
+        output_fields = dict(
             loss=loss,
             logits=logits,
             hidden_states=outputs.hidden_states if output_hidden_states else None,
             attentions=outputs.attentions,
         )
+        if return_decoder_features:
+            return DecoderFeatureOutput(**output_fields, decoder_features=decoder_features)
+        return SemanticSegmenterOutput(**output_fields)

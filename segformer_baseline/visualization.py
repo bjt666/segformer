@@ -80,7 +80,11 @@ def plot_history(history: list[dict], output_dir: Path) -> None:
     losses = [("train_loss", "Training"), ("val_loss", "Validation")]
     if any("train_main_loss" in row for row in history):
         losses = [("train_loss", "Training total"), ("train_main_loss", "Training main CE"),
-                  ("train_aux_loss", "Training coarse CE (unweighted)"), ("val_loss", "Validation main CE")]
+                  ("val_loss", "Validation main CE")]
+        if any("train_aux_loss" in row for row in history):
+            losses.insert(2, ("train_aux_loss", "Training coarse CE (unweighted)"))
+        if any("train_contrastive_loss" in row for row in history):
+            losses.insert(2, ("train_contrastive_loss", "Training contrastive (unweighted)"))
     for filename, series, ylabel in (
         ("loss.png", losses, "Loss"),
         ("metrics.png", [("val_foreground_iou", "Foreground IoU"), ("val_miou", "mIoU"),

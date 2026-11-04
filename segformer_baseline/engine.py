@@ -12,6 +12,7 @@ import torch
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from .contrastive import HardAlgaeContrastiveLoss
 from .metrics import confusion_matrix, metrics_from_confusion
 
 
@@ -22,9 +23,15 @@ def resized_logits(model, images: torch.Tensor, size: tuple[int, int]) -> torch.
     return F.interpolate(logits, size=size, mode="bilinear", align_corners=False)
 
 
-def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion) -> dict:
-    """Final-head CE plus optional coarse-F2 CE, without caching forward tensors."""
-    outputs = model(pixel_values=images)
+def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion, *,
+                    contrastive: HardAlgaeContrastiveLoss | None = None,
+                    contrastive_weight: float = 0.0) -> dict:
+    """Combine segmentation CE and any active training-only supervision."""
+    use_contrastive = contrastive is not None and contrastive_weight > 0
+    if use_contrastive:
+        outputs = model(pixel_values=images, return_dict=True, return_decoder_features=True)
+    else:
+        outputs = model(pixel_values=images)
     logits = outputs.logits
     if logits.shape[-2:] != masks.shape[-2:]:
         logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
@@ -37,24 +44,34 @@ def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion)
                                          mode="bilinear", align_corners=False)
         auxiliary_loss = criterion(auxiliary_logits, masks)
         weight = model.config.local_refinement["discrimination_aux_weight"]
-    return {"loss": main_loss + weight * auxiliary_loss, "main_loss": main_loss,
-            "auxiliary_loss": auxiliary_loss, "auxiliary_weight": weight}
+    loss = main_loss + weight * auxiliary_loss
+    contrastive_loss = None
+    if use_contrastive:
+        contrastive_loss = contrastive(outputs.decoder_features, images, masks, logits)
+        if contrastive_loss is not None:
+            loss = loss + contrastive_weight * contrastive_loss
+    return {"loss": loss, "main_loss": main_loss, "auxiliary_loss": auxiliary_loss,
+            "auxiliary_weight": weight, "contrastive_loss": contrastive_loss}
 
 
 def train_epoch(model, loader, optimizer, criterion, device: torch.device,
-                epoch: int, total_epochs: int, log_every: int) -> dict:
+                epoch: int, total_epochs: int, log_every: int, *,
+                contrastive: HardAlgaeContrastiveLoss | None = None,
+                contrastive_weight: float = 0.0) -> dict:
     logger = logging.getLogger("segformer")
     model.train()
     started = time.monotonic()
     total_loss = 0.0
     total_main_loss, total_auxiliary_loss = 0.0, 0.0
+    total_contrastive_loss, contrastive_batches = 0.0, 0
     num_images = 0
     bar = tqdm(loader, desc=f"Train {epoch}/{total_epochs}", disable=not sys.stderr.isatty())
     for step, batch in enumerate(bar, start=1):
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
-        losses = training_losses(model, images, masks, criterion)
+        losses = training_losses(model, images, masks, criterion, contrastive=contrastive,
+                                 contrastive_weight=contrastive_weight)
         loss = losses["loss"]
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Nonfinite training loss at epoch {epoch}, batch {step}.")
@@ -63,6 +80,9 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
         total_loss += loss.item() * images.size(0)
         total_main_loss += losses["main_loss"].item() * images.size(0)
         total_auxiliary_loss += losses["auxiliary_loss"].item() * images.size(0)
+        if losses["contrastive_loss"] is not None:
+            total_contrastive_loss += losses["contrastive_loss"].item() * images.size(0)
+            contrastive_batches += 1
         num_images += images.size(0)
         bar.set_postfix(loss=f"{total_loss / num_images:.5f}", lr=f"{optimizer.param_groups[0]['lr']:.2g}")
         if step == 1 or step % log_every == 0 or step == len(loader):
@@ -75,8 +95,14 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
                 logger.info("Loss components | main CE %.6f | coarse CE %.6f | coarse weight %.3g",
                             total_main_loss / num_images, total_auxiliary_loss / num_images,
                             losses["auxiliary_weight"])
+            if contrastive_weight > 0:
+                logger.info("Loss components | main CE %.6f | contrastive %.6f | weight %.3g | active batches %s/%s",
+                            total_main_loss / num_images, total_contrastive_loss / num_images,
+                            contrastive_weight, contrastive_batches, step)
     return {"loss": total_loss / num_images, "main_loss": total_main_loss / num_images,
-            "auxiliary_loss": total_auxiliary_loss / num_images, "seconds": time.monotonic() - started}
+            "auxiliary_loss": total_auxiliary_loss / num_images,
+            "contrastive_loss": total_contrastive_loss / num_images,
+            "contrastive_batches": contrastive_batches, "seconds": time.monotonic() - started}
 
 
 @torch.inference_mode()

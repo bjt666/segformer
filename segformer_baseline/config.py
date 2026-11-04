@@ -11,6 +11,7 @@ import yaml
 
 
 SPECTRAL_REFINEMENT_MODES = ("off", "concat", "local")
+TRAINING_LOSSES = ("cross_entropy", "cross_entropy_contrastive")
 
 DEFAULTS: dict[str, Any] = {
     "data_root": "dataset", "output_dir": None, "epochs": 100,
@@ -19,6 +20,8 @@ DEFAULTS: dict[str, Any] = {
     "input_channels": [3, 2, 1], "input_bands": ["NIR", "R", "G"],
     "encoder_lr": 6e-5, "decoder_lr": 6e-4, "weight_decay": 0.01,
     "loss": "cross_entropy", "log_every": 20, "visualization_samples": 8,
+    "contrastive_weight": 0.1, "contrastive_temperature": 0.1,
+    "contrastive_samples": 128, "contrastive_warmup_epochs": 5,
     "module_a": False, "module_b": False,
     "local_kernels": [3, 5, 7], "refinement_stages": [1, 2],
     "gate_mode": "deep_shallow", "gate_reduction": 4,
@@ -168,8 +171,22 @@ def validate_config(config: dict[str, Any]) -> None:
         not isinstance(band, str) or not band for band in bands
     ):
         raise ValueError("input_bands must name each selected channel.")
-    if config["loss"] != "cross_entropy":
-        raise ValueError("This baseline implements unweighted cross_entropy only.")
+    if config["loss"] not in TRAINING_LOSSES:
+        raise ValueError("loss must be cross_entropy or cross_entropy_contrastive.")
+    if config["loss"] == "cross_entropy_contrastive":
+        if config["decoder_upsampling"] != "learned" or config["dual_encoder"] or config["encoder_discrimination"]:
+            raise ValueError("Contrastive training requires learned upsampling and the single MiT encoder.")
+        if 3 not in channels:
+            raise ValueError("Contrastive training requires the NIR source band (input channel index 3).")
+        for key in ("contrastive_weight", "contrastive_temperature"):
+            value = config[key]
+            if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{key} must be finite and positive.")
+        if type(config["contrastive_samples"]) is not int or config["contrastive_samples"] < 1:
+            raise ValueError("contrastive_samples must be a positive integer.")
+        warmup = config["contrastive_warmup_epochs"]
+        if type(warmup) is not int or not 0 <= warmup < config["epochs"]:
+            raise ValueError("contrastive_warmup_epochs must be nonnegative and less than epochs.")
 
 
 def save_config(config: dict[str, Any], path: Path) -> None:

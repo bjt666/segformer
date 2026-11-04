@@ -14,7 +14,12 @@ input_bands: [NIR, R, G]
 encoder_lr: 0.00006
 decoder_lr: 0.0006
 weight_decay: 0.01
+# Use cross_entropy_contrastive for the hard-algae experiment.
 loss: cross_entropy
+contrastive_weight: 0.1
+contrastive_temperature: 0.1
+contrastive_samples: 128
+contrastive_warmup_epochs: 5
 log_every: 20
 visualization_samples: 8
 

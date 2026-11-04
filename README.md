@@ -15,6 +15,19 @@
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
 
+## 马尾藻难例对比训练
+
+在改进解码器＋FreqFusion 配置上使用 `--loss cross_entropy_contrastive` 开启实验。前 5 轮使用交叉熵，随后添加权重为 0.1 的对比损失。训练批次内，以标注的背景像素在 31×31 邻域中的平均 NIR 为参照，将可估计局部背景的马尾藻像素按绝对差值排序。低对比度四分位提供弱藻带查询，高对比度四分位提供同类参照，模型给出高前景分数的标注背景提供难负样本。每组每批最多取 128 个像素；缺少合适样本的批次继续计算交叉熵。
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python train.py \
+  --config configs/segformer_b0_decoder_freqfusion.yaml \
+  --loss cross_entropy_contrastive \
+  --output-dir outputs/gf16m_hard_algae_contrastive_s42
+```
+
+对比损失使用分类前的解码特征，部署沿用轻量版的参数量和前向路径。训练输出的 `metrics.csv` 记录 `train_main_loss`、`train_contrastive_loss`、`train_contrastive_weight` 和 `train_contrastive_batches`，仍用验证集前景 IoU 选 `best.pt`。
+
 ## 完整双编码器：MiT-B0＋ResNet-50
 
 本轮主配置为 `configs/segformer_b0_dual_full.yaml`。同一幅 NIR/R/G 图像进入 MiT-B0 与完整 ResNet-50。两路各输出 1/4、1/8、1/16、1/32 尺度特征，在每一级进行交互；ResNet 输入层另分出 1/2 尺度特征，经过三个空间残差卷积块持续处理，在解码恢复到半尺寸时参与最终融合。旧 A/B 和前景／背景判别分支均关闭，训练只有最终分割头的交叉熵。

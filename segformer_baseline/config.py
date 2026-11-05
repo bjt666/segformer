@@ -11,7 +11,7 @@ import yaml
 
 
 SPECTRAL_REFINEMENT_MODES = ("off", "concat", "local")
-TRAINING_LOSSES = ("cross_entropy", "cross_entropy_contrastive")
+TRAINING_LOSSES = ("cross_entropy", "cross_entropy_contrastive", "cross_entropy_lovasz")
 
 DEFAULTS: dict[str, Any] = {
     "data_root": "dataset", "output_dir": None, "epochs": 100,
@@ -20,6 +20,7 @@ DEFAULTS: dict[str, Any] = {
     "input_channels": [3, 2, 1], "input_bands": ["NIR", "R", "G"],
     "encoder_lr": 6e-5, "decoder_lr": 6e-4, "weight_decay": 0.01,
     "loss": "cross_entropy", "log_every": 20, "visualization_samples": 8,
+    "lovasz_weight": 0.1,
     "contrastive_weight": 0.1, "contrastive_temperature": 0.1,
     "contrastive_samples": 128, "contrastive_warmup_epochs": 5,
     "module_a": False, "module_b": False,
@@ -172,7 +173,11 @@ def validate_config(config: dict[str, Any]) -> None:
     ):
         raise ValueError("input_bands must name each selected channel.")
     if config["loss"] not in TRAINING_LOSSES:
-        raise ValueError("loss must be cross_entropy or cross_entropy_contrastive.")
+        raise ValueError(f"loss must be one of {', '.join(TRAINING_LOSSES)}.")
+    if config["loss"] == "cross_entropy_lovasz":
+        weight = config["lovasz_weight"]
+        if type(weight) not in (int, float) or not math.isfinite(weight) or weight <= 0:
+            raise ValueError("lovasz_weight must be finite and positive.")
     if config["loss"] == "cross_entropy_contrastive":
         if config["decoder_upsampling"] != "learned" or config["dual_encoder"] or config["encoder_discrimination"]:
             raise ValueError("Contrastive training requires learned upsampling and the single MiT encoder.")

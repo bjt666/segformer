@@ -15,6 +15,19 @@
 
 这些是初始基线设置，不代表已通过实验确认最优。模型改进的消融应保持输入、预训练、划分和训练设置一致。
 
+## 前景 Lovász 损失对照
+
+在改进解码器＋FreqFusion 配置上使用 `--loss cross_entropy_lovasz`。从第 1 轮开始使用交叉熵与前景 Lovász-Softmax 的加权和，默认 `lovasz_weight: 0.1`。Lovász 项按批次汇总像素，纯背景批次使用交叉熵。有前景的批次中，背景像素参与前景误报的惩罚。验证仍用交叉熵记录损失，以验证集前景 IoU 选 `best.pt`。
+
+```bash
+HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 python train.py \
+  --config configs/segformer_b0_decoder_freqfusion.yaml \
+  --loss cross_entropy_lovasz \
+  --output-dir outputs/gf16m_lovasz_s42
+```
+
+训练输出的 `metrics.csv` 分别记录 `train_main_loss`、`train_lovasz_loss`、`train_lovasz_weight` 和 `train_lovasz_batches`。损失依据 Berman 等人的 [Lovász-Softmax 论文](https://openaccess.thecvf.com/content_cvpr_2018/html/Berman_The_LovaSz-Softmax_Loss_CVPR_2018_paper.html)。
+
 ## 马尾藻难例对比训练
 
 在改进解码器＋FreqFusion 配置上使用 `--loss cross_entropy_contrastive` 开启实验。前 5 轮使用交叉熵，随后添加权重为 0.1 的对比损失。训练批次内，以标注的背景像素在 31×31 邻域中的平均 NIR 为参照，将可估计局部背景的马尾藻像素按绝对差值排序。低对比度四分位提供弱藻带查询，高对比度四分位提供同类参照，模型给出高前景分数的标注背景提供难负样本。每组每批最多取 128 个像素；缺少合适样本的批次继续计算交叉熵。

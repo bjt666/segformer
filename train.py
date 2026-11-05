@@ -43,7 +43,7 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument("--" + field.replace("_", "-"), type=Path)
     for field in ("epochs", "batch_size", "num_workers", "seed", "log_every", "visualization_samples"):
         parser.add_argument("--" + field.replace("_", "-"), type=int)
-    for field in ("encoder_lr", "decoder_lr", "weight_decay"):
+    for field in ("encoder_lr", "decoder_lr", "weight_decay", "lovasz_weight"):
         parser.add_argument("--" + field.replace("_", "-"), type=float)
     parser.add_argument("--device")
     parser.add_argument("--pretrained-model")
@@ -106,6 +106,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant += f"-dual-interaction{int(config['dual_interaction'])}-highres{int(config['dual_highres'])}"
         if config["loss"] == "cross_entropy_contrastive":
             variant += "-hard-algae-contrastive"
+        elif config["loss"] == "cross_entropy_lovasz":
+            variant += "-foreground-lovasz"
         config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())
@@ -176,6 +178,9 @@ def main() -> None:
                     config["decoder_lr"], config["encoder_lr"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
     criterion = nn.CrossEntropyLoss()
+    lovasz_weight = config["lovasz_weight"] if config["loss"] == "cross_entropy_lovasz" else 0.0
+    if lovasz_weight:
+        logger.info("Training objective | main CE + %.3g * batch foreground Lovasz", lovasz_weight)
     contrastive = None
     if config["loss"] == "cross_entropy_contrastive":
         contrastive = HardAlgaeContrastiveLoss(config)
@@ -244,7 +249,7 @@ def main() -> None:
             contrastive_weight = config["contrastive_weight"]
         train_result = train_epoch(model, train_loader, optimizer, criterion, device,
                                    epoch, config["epochs"], config["log_every"], contrastive=contrastive,
-                                   contrastive_weight=contrastive_weight)
+                                   contrastive_weight=contrastive_weight, lovasz_weight=lovasz_weight)
         val_result = evaluate_model(model, val_loader, device, criterion,
                                     description=f"Validation {epoch}/{config['epochs']}",
                                     log_every=config["log_every"], collect_per_image=False,
@@ -273,6 +278,11 @@ def main() -> None:
                         "train_contrastive_loss": train_result["contrastive_loss"],
                         "train_contrastive_weight": contrastive_weight,
                         "train_contrastive_batches": train_result["contrastive_batches"]})
+        if lovasz_weight:
+            row.update({"train_main_loss": train_result["main_loss"],
+                        "train_lovasz_loss": train_result["lovasz_loss"],
+                        "train_lovasz_weight": lovasz_weight,
+                        "train_lovasz_batches": train_result["lovasz_batches"]})
         history.append(row)
         payload = make_checkpoint(model, optimizer, scheduler, epoch, best_iou, best_epoch,
                                   config, mean, std, history, manifest, generators, environment)

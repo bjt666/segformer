@@ -13,6 +13,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .contrastive import HardAlgaeContrastiveLoss
+from .lovasz import foreground_lovasz_loss
 from .metrics import confusion_matrix, metrics_from_confusion
 
 
@@ -25,7 +26,7 @@ def resized_logits(model, images: torch.Tensor, size: tuple[int, int]) -> torch.
 
 def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion, *,
                     contrastive: HardAlgaeContrastiveLoss | None = None,
-                    contrastive_weight: float = 0.0) -> dict:
+                    contrastive_weight: float = 0.0, lovasz_weight: float = 0.0) -> dict:
     """Combine segmentation CE and any active training-only supervision."""
     use_contrastive = contrastive is not None and contrastive_weight > 0
     if use_contrastive:
@@ -50,20 +51,26 @@ def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion,
         contrastive_loss = contrastive(outputs.decoder_features, images, masks, logits)
         if contrastive_loss is not None:
             loss = loss + contrastive_weight * contrastive_loss
+    lovasz_loss = None
+    if lovasz_weight > 0:
+        lovasz_loss = foreground_lovasz_loss(logits, masks)
+        if lovasz_loss is not None:
+            loss = loss + lovasz_weight * lovasz_loss
     return {"loss": loss, "main_loss": main_loss, "auxiliary_loss": auxiliary_loss,
-            "auxiliary_weight": weight, "contrastive_loss": contrastive_loss}
+            "auxiliary_weight": weight, "contrastive_loss": contrastive_loss, "lovasz_loss": lovasz_loss}
 
 
 def train_epoch(model, loader, optimizer, criterion, device: torch.device,
                 epoch: int, total_epochs: int, log_every: int, *,
                 contrastive: HardAlgaeContrastiveLoss | None = None,
-                contrastive_weight: float = 0.0) -> dict:
+                contrastive_weight: float = 0.0, lovasz_weight: float = 0.0) -> dict:
     logger = logging.getLogger("segformer")
     model.train()
     started = time.monotonic()
     total_loss = 0.0
     total_main_loss, total_auxiliary_loss = 0.0, 0.0
     total_contrastive_loss, contrastive_batches = 0.0, 0
+    total_lovasz_loss, lovasz_batches = 0.0, 0
     num_images = 0
     bar = tqdm(loader, desc=f"Train {epoch}/{total_epochs}", disable=not sys.stderr.isatty())
     for step, batch in enumerate(bar, start=1):
@@ -71,7 +78,7 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
         masks = batch["mask"].to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
         losses = training_losses(model, images, masks, criterion, contrastive=contrastive,
-                                 contrastive_weight=contrastive_weight)
+                                 contrastive_weight=contrastive_weight, lovasz_weight=lovasz_weight)
         loss = losses["loss"]
         if not torch.isfinite(loss):
             raise FloatingPointError(f"Nonfinite training loss at epoch {epoch}, batch {step}.")
@@ -83,6 +90,9 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
         if losses["contrastive_loss"] is not None:
             total_contrastive_loss += losses["contrastive_loss"].item() * images.size(0)
             contrastive_batches += 1
+        if losses["lovasz_loss"] is not None:
+            total_lovasz_loss += losses["lovasz_loss"].item() * images.size(0)
+            lovasz_batches += 1
         num_images += images.size(0)
         bar.set_postfix(loss=f"{total_loss / num_images:.5f}", lr=f"{optimizer.param_groups[0]['lr']:.2g}")
         if step == 1 or step % log_every == 0 or step == len(loader):
@@ -99,10 +109,16 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
                 logger.info("Loss components | main CE %.6f | contrastive %.6f | weight %.3g | active batches %s/%s",
                             total_main_loss / num_images, total_contrastive_loss / num_images,
                             contrastive_weight, contrastive_batches, step)
+            if lovasz_weight > 0:
+                logger.info("Loss components | main CE %.6f | foreground Lovasz %.6f | weight %.3g | active batches %s/%s",
+                            total_main_loss / num_images, total_lovasz_loss / num_images,
+                            lovasz_weight, lovasz_batches, step)
     return {"loss": total_loss / num_images, "main_loss": total_main_loss / num_images,
             "auxiliary_loss": total_auxiliary_loss / num_images,
             "contrastive_loss": total_contrastive_loss / num_images,
-            "contrastive_batches": contrastive_batches, "seconds": time.monotonic() - started}
+            "contrastive_batches": contrastive_batches,
+            "lovasz_loss": total_lovasz_loss / num_images, "lovasz_batches": lovasz_batches,
+            "seconds": time.monotonic() - started}
 
 
 @torch.inference_mode()

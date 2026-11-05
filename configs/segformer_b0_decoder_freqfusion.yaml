@@ -14,8 +14,9 @@ input_bands: [NIR, R, G]
 encoder_lr: 0.00006
 decoder_lr: 0.0006
 weight_decay: 0.01
-# Use cross_entropy_contrastive for the hard-algae experiment.
+# Training loss options: cross_entropy, cross_entropy_lovasz, cross_entropy_contrastive.
 loss: cross_entropy
+lovasz_weight: 0.1
 contrastive_weight: 0.1
 contrastive_temperature: 0.1
 contrastive_samples: 128

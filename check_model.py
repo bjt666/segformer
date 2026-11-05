@@ -50,10 +50,14 @@ def main():
         images = torch.randn(config["batch_size"], len(config["input_channels"]), args.size, args.size, device=device)
         masks = torch.randint(0, 2, (config["batch_size"], args.size, args.size), device=device)
         contrastive = HardAlgaeContrastiveLoss(config) if config["loss"] == "cross_entropy_contrastive" else None
+        lovasz_weight = config["lovasz_weight"] if config["loss"] == "cross_entropy_lovasz" else 0.0
         losses = training_losses(model, images, masks, torch.nn.CrossEntropyLoss(),
-                                 contrastive=contrastive, contrastive_weight=config["contrastive_weight"])
+                                 contrastive=contrastive, contrastive_weight=config["contrastive_weight"],
+                                 lovasz_weight=lovasz_weight)
         if contrastive is not None and losses["contrastive_loss"] is None:
             raise RuntimeError("The synthetic batch did not exercise the contrastive loss.")
+        if lovasz_weight and losses["lovasz_loss"] is None:
+            raise RuntimeError("The synthetic batch did not exercise the Lovasz loss.")
         if not torch.isfinite(losses["loss"]):
             raise FloatingPointError("Nonfinite preflight loss")
         losses["loss"].backward()
@@ -66,6 +70,8 @@ def main():
                   "parameters": model_parameter_counts(model),
                   "peak_allocated_mib": torch.cuda.max_memory_allocated(device) / 1024**2 if device.type == "cuda" else None,
                   "peak_reserved_mib": torch.cuda.max_memory_reserved(device) / 1024**2 if device.type == "cuda" else None}
+        if lovasz_weight:
+            report["lovasz_loss"] = losses["lovasz_loss"].item()
         print(json.dumps(report, indent=2))
     except torch.cuda.OutOfMemoryError:
         raise SystemExit("CUDA memory insufficient for this batch. Try a smaller --batch-size in this check; "

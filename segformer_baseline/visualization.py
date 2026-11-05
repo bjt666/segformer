@@ -85,6 +85,8 @@ def plot_history(history: list[dict], output_dir: Path) -> None:
             losses.insert(2, ("train_aux_loss", "Training coarse CE (unweighted)"))
         if any("train_contrastive_loss" in row for row in history):
             losses.insert(2, ("train_contrastive_loss", "Training contrastive (unweighted)"))
+        if any("train_lovasz_loss" in row for row in history):
+            losses.insert(2, ("train_lovasz_loss", "Training foreground Lovasz (unweighted)"))
     for filename, series, ylabel in (
         ("loss.png", losses, "Loss"),
         ("metrics.png", [("val_foreground_iou", "Foreground IoU"), ("val_miou", "mIoU"),

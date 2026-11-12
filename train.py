@@ -102,6 +102,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant += f"-spectral-{config['spectral_refinement']}"
         if config["encoder_discrimination"]:
             variant += f"-discrimination-{config['discrimination_mode']}"
+        if config["encoder_unravel"]:
+            variant += "-unravel-f2"
         if config["dual_encoder"]:
             variant += f"-dual-interaction{int(config['dual_interaction'])}-highres{int(config['dual_highres'])}"
         if config["loss"] == "cross_entropy_contrastive":
@@ -175,6 +177,11 @@ def main() -> None:
         logger.info("Encoder discrimination mode=%s | main CE + %.3g * coarse CE | "
                     "new branch uses decoder lr %.3g; pretrained backbone lr %.3g",
                     config["discrimination_mode"], config["discrimination_aux_weight"],
+                    config["decoder_lr"], config["encoder_lr"])
+    if config["encoder_unravel"]:
+        logger.info("F2 Unravel adapter only | width=%s quality_width=%s directional_kernel=%s | "
+                    "new adapter lr %.3g; pretrained MiT lr %.3g | no auxiliary loss",
+                    config["unravel_channels"], config["unravel_quality_channels"], config["unravel_kernel"],
                     config["decoder_lr"], config["encoder_lr"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
     criterion = nn.CrossEntropyLoss()

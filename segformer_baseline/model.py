@@ -13,6 +13,7 @@ from .decoder import DecoderHead, DecoderSegformerForSemanticSegmentation
 from .discrimination import DiscriminativeEncoder, DiscriminationSegformerForSemanticSegmentation
 from .hybrid import DualEncoder, DualSegformerForSemanticSegmentation, HighResolutionFusion
 from .refinement import RefinedDecodeHead
+from .unravel import UnravelEncoder
 
 
 ARCHITECTURE_FIELDS = (
@@ -26,6 +27,8 @@ ARCHITECTURE_FIELDS = (
     "discrimination_temperature", "discrimination_aux_weight",
     "dual_encoder", "dual_interaction", "dual_highres", "dual_highres_channels",
     "dual_highres_blocks", "dual_residual_scale",
+    "encoder_unravel", "unravel_channels", "unravel_kernel",
+    "unravel_quality_channels", "unravel_residual_scale",
 )
 
 
@@ -92,6 +95,7 @@ def model_parameter_counts(model) -> dict:
     discrimination = count(model.segformer.encoder.discrimination) if (
         isinstance(model.segformer.encoder, DiscriminativeEncoder)
     ) else 0
+    unravel = count(model.segformer.encoder.unravel) if isinstance(model.segformer.encoder, UnravelEncoder) else 0
     decoder = count(model.decode_head)
     freqfusion = count(model.decode_head.freqfusion_blocks) if (
         isinstance(model.decode_head, DecoderHead) and model.decode_head.freqfusion
@@ -112,11 +116,12 @@ def model_parameter_counts(model) -> dict:
     else:
         original_decoder, refinement, redesign = decoder, 0, 0
     return {"total": count(model), "trainable": sum(p.numel() for p in model.parameters() if p.requires_grad),
-            "encoder": encoder, "encoder_backbone": encoder - discrimination - exchange - highres,
-            "mit_encoder": encoder - discrimination - cnn - exchange - highres,
+            "encoder": encoder, "encoder_backbone": encoder - discrimination - exchange - highres - unravel,
+            "mit_encoder": encoder - discrimination - cnn - exchange - highres - unravel,
             "cnn_encoder": cnn, "cross_interaction": exchange,
             "high_resolution_branch": highres, "high_resolution_fusion": highres_fusion,
             "encoder_discrimination": discrimination,
+            "encoder_unravel": unravel,
             "decoder": decoder, "original_decoder": original_decoder,
             "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion,
             "spectral_refinement": spectral_refinement}
@@ -131,6 +136,8 @@ def optimizer_parameter_groups(model, config: dict) -> list[dict]:
     branch = (model.segformer.encoder.discrimination
               if isinstance(model.segformer.encoder, DiscriminativeEncoder) else None)
     new_parameters = list(branch.parameters()) if branch is not None else []
+    if isinstance(model.segformer.encoder, UnravelEncoder):
+        new_parameters.extend(model.segformer.encoder.unravel.parameters())
     if isinstance(model.segformer.encoder, DualEncoder):
         new_parameters.extend(model.segformer.encoder.new_parameters())
     new_ids = {id(parameter) for parameter in new_parameters}
@@ -163,6 +170,9 @@ def _attach_architecture(model, architecture: dict) -> None:
     if architecture["encoder_discrimination"]:
         with torch.random.fork_rng(devices=[]):
             model.segformer.encoder = DiscriminativeEncoder(model.segformer.encoder, model.config, architecture)
+    if architecture["encoder_unravel"]:
+        with torch.random.fork_rng(devices=[]):
+            model.segformer.encoder = UnravelEncoder(model.segformer.encoder, model.config, architecture)
     if architecture["dual_encoder"]:
         with torch.random.fork_rng(devices=[]):
             model.segformer.encoder = DualEncoder(model.segformer.encoder, model.config, architecture)

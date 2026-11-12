@@ -2,6 +2,100 @@
 
 用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion、MiT/ResNet-50 双编码器及高分辨率恢复、前景／背景判别分支；旧实验保留用于复现。
 
+## F2 编码器轻量适配模块
+
+仅在 MiT **Stage 2 的输出归一化之后**插入一个 UnravelNet 机制适配模块 E。
+增强后的 F2 同时送往 Stage 3 和解码器；F1 不变，F3/F4 由新的 F2 继续提取。
+模块输入输出均为 `B × 64 × 32 × 32`（B0、256×256 输入），不新增第二编码器或原图分支。
+
+默认内部投影到 128 通道，四组各 32 通道分别执行点特征门控、3×3 局部处理、
+横/纵/两条对角方向的中程交互、Gaussian 相关特征与空间/通道交互。
+拼接后经轻量混合、投影回 64 通道，以 `F2 + alpha * correction` 反馈。
+`alpha` 初始为 0.1，输出投影使用小幅随机初始化；两者均可训练。
+模块无前景粗预测、边界头、额外标注或辅助损失。
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `encoder_unravel` | `false` | 独立总开关；打开时固定只作用于 F2 |
+| `unravel_channels` | `128` | 模块内部通道数，必须能被 4 整除 |
+| `unravel_kernel` | `7` | 中程方向卷积的长度 |
+| `unravel_quality_channels` | `64` | 低质量特征路径最大宽度 |
+| `unravel_residual_scale` | `0.1` | 可学习残差系数的初值 |
+
+关闭 E 时保留原模型路径、参数名和随机数序列。旧配置缺少这些字段时默认关闭，
+已有权重继续支持评估、预测和恢复。首轮 E 实验关闭旧 A/B、判别分支和双编码器。
+新增 E 与随机初始化的解码器使用 `decoder_lr=6e-4`，预训练 MiT 使用 `encoder_lr=6e-5`。
+
+四个配置的主损失统一为 `CE + 0.1 * foreground Lovasz`，100 轮、batch size 8、seed 42：
+
+| 实验 | 配置 | E | 改进解码器/FreqFusion |
+| --- | --- | --- | --- |
+| B0，匹配损失的基线 | `configs/segformer_b0_lovasz.yaml` | 关 | 关 |
+| B0 + E | `configs/segformer_b0_unravel_f2.yaml` | 开 | 关 |
+| B0 + D | `configs/segformer_b0_decoder_freqfusion_lovasz.yaml` | 关 | 开 |
+| B0 + D + E | `configs/segformer_b0_decoder_freqfusion_unravel_f2.yaml` | 开 | 开 |
+
+默认 B0 的实际实例化参数统计（含可学习残差系数，不含固定 Gaussian 缓冲区）：
+
+| 结构 | 总参数 | 新增 E |
+| --- | ---: | ---: |
+| B0 | 3,714,658 | 0 |
+| B0 + E | 3,884,134 | 169,476 |
+| B0 + D | 5,601,432 | 0 |
+| B0 + D + E | 5,770,908 | 169,476 |
+
+E 使现有组合参数增加约 3.03%；Lovasz 损失不增加推理参数。
+
+首轮直接跑最后一组，与已有 `gf16m_lovasz_s42` 对比，不必重跑这个已有参考实验。
+原版 B0 的 CE 结果不能替代同损失的 B0 基线。E 的独立性消融可随后用第二组补充。
+
+```bash
+cd /root/segformer
+source /etc/network_turbo
+git pull --ff-only
+
+# Existing complete MiT cache is required; these variables prevent online HEAD requests.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+python train.py \
+  --config configs/segformer_b0_decoder_freqfusion_unravel_f2.yaml \
+  --output-dir outputs/gf16m_decoder_freqfusion_unravel_f2_lovasz_s42
+
+python evaluate.py --data-root dataset \
+  --checkpoint outputs/gf16m_decoder_freqfusion_unravel_f2_lovasz_s42/checkpoints/best.pt \
+  --split test \
+  --output-dir outputs/gf16m_decoder_freqfusion_unravel_f2_lovasz_s42/evaluation/test
+
+python predict.py \
+  --checkpoint outputs/gf16m_decoder_freqfusion_unravel_f2_lovasz_s42/checkpoints/best.pt \
+  --input dataset/images/test --mask-dir dataset/masks/test \
+  --save-probabilities \
+  --output-dir outputs/gf16m_decoder_freqfusion_unravel_f2_lovasz_s42/predictions/test
+```
+
+首次新结构训练仍从相同来源的 ImageNet MiT 权重开始，E 随机初始化。
+已有本地 HF 编码器目录时，在训练命令追加 `--pretrained-model /root/models/mit-b0`。
+不可通过旧分割模型的 `--resume` 启动新结构。中断后只恢复本次自己的状态：
+
+```bash
+python train.py --resume outputs/gf16m_decoder_freqfusion_unravel_f2_lovasz_s42/checkpoints/last.pt
+```
+
+评估与预测会根据检查点自动恢复 E，无需再传配置。固定输出目录用于首次评估/预测；
+重复运行时换新目录或省略 `--output-dir`，由程序创建时间戳目录。
+训练前可用 `python check_model.py --config configs/segformer_b0_decoder_freqfusion_unravel_f2.yaml`
+检查单批梯度、参数和显存。正式训练检查 `architecture.json` 的 `encoder_unravel: true`，
+以及 `model_summary.json` 的 `parameter_counts.encoder_unravel`；参数增量由实际实例统计，
+不能代替 GFLOPs 或延迟测量。
+
+实现参考 [UnravelNet 论文](https://doi.org/10.1016/j.isprsjprs.2025.11.002)
+及[作者模块代码](https://github.com/AeroVILab-AHU/LEGNet/blob/main/mmrotate/models/backbones/unravelnet.py)。
+本模块属于轻量适配：将作者质量路径固定 256 通道改为 32/64 通道，采用 GroupNorm、
+归一化的固定 Gaussian 核、支持矩形/奇数尺寸的方向卷积及 F2 残差接口。
+仅依赖现有 PyTorch，不需要新增软件包。它不等同于完整 UnravelNet 或数值复现，
+Gaussian 路径也不代表已证明能抑制海面噪声。来源及上游 MIT 许可见 `THIRD_PARTY_NOTICES.md`。
+
 ## 基线设置
 
 - 默认模型：SegFormer-B0，Hugging Face Transformers 实现，保留原始 MLP 解码器。

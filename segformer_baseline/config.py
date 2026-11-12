@@ -34,6 +34,8 @@ DEFAULTS: dict[str, Any] = {
     "freqfusion_resample_groups": 4, "freqfusion_checkpoint": True,
     "freqfusion_chunk_size": 32,
     "spectral_refinement": "off",
+    "encoder_unravel": False, "unravel_channels": 128, "unravel_kernel": 7,
+    "unravel_quality_channels": 64, "unravel_residual_scale": 0.1,
     "encoder_discrimination": False, "discrimination_mode": "feedback",
     "discrimination_channels": 32, "discrimination_temperature": 0.2,
     "discrimination_aux_weight": 0.2,
@@ -75,11 +77,27 @@ def validate_config(config: dict[str, Any]) -> None:
     if type(config["pretrained"]) is not bool:
         raise ValueError("pretrained must be true or false.")
     for key in ("module_a", "module_b", "freqfusion", "freqfusion_checkpoint", "encoder_discrimination",
-                "dual_encoder", "dual_interaction", "dual_highres"):
+                "dual_encoder", "dual_interaction", "dual_highres", "encoder_unravel"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be true or false.")
     if config["module_b"] and not config["module_a"]:
         raise ValueError("module_b selects module_a branches and requires module_a: true.")
+    width = config["unravel_channels"]
+    if type(width) is not int or width < 16 or width % 4:
+        raise ValueError("unravel_channels must be at least 16 and divisible by four.")
+    quality_width = config["unravel_quality_channels"]
+    if type(quality_width) is not int or quality_width < 16 or quality_width % 2:
+        raise ValueError("unravel_quality_channels must be even and at least 16.")
+    kernel = config["unravel_kernel"]
+    if type(kernel) is not int or not 3 <= kernel <= 15 or kernel % 2 != 1:
+        raise ValueError("unravel_kernel must be an odd integer from 3 to 15.")
+    scale = config["unravel_residual_scale"]
+    if type(scale) not in (int, float) or not math.isfinite(scale) or not 0 < scale <= 1:
+        raise ValueError("unravel_residual_scale must be finite and in (0, 1].")
+    if config["encoder_unravel"] and any(config[key] for key in (
+        "module_a", "module_b", "encoder_discrimination", "dual_encoder"
+    )):
+        raise ValueError("F2 Unravel experiments require legacy A/B, encoder_discrimination and dual_encoder OFF.")
     for key in ("dual_highres_channels", "dual_highres_blocks"):
         if type(config[key]) is not int or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer.")

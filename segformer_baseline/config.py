@@ -34,6 +34,8 @@ DEFAULTS: dict[str, Any] = {
     "freqfusion_resample_groups": 4, "freqfusion_checkpoint": True,
     "freqfusion_chunk_size": 32,
     "spectral_refinement": "off",
+    "error_refinement": False, "error_refinement_mode": "gated", "error_refinement_channels": 32,
+    "error_max_correction": 4.0, "error_risk_weight": 0.1, "error_coarse_weight": 0.2,
     "encoder_unravel": False, "unravel_channels": 128, "unravel_kernel": 7,
     "unravel_quality_channels": 64, "unravel_residual_scale": 0.1,
     "encoder_discrimination": False, "discrimination_mode": "feedback",
@@ -77,11 +79,28 @@ def validate_config(config: dict[str, Any]) -> None:
     if type(config["pretrained"]) is not bool:
         raise ValueError("pretrained must be true or false.")
     for key in ("module_a", "module_b", "freqfusion", "freqfusion_checkpoint", "encoder_discrimination",
-                "dual_encoder", "dual_interaction", "dual_highres", "encoder_unravel"):
+                "dual_encoder", "dual_interaction", "dual_highres", "encoder_unravel", "error_refinement"):
         if type(config[key]) is not bool:
             raise ValueError(f"{key} must be true or false.")
     if config["module_b"] and not config["module_a"]:
         raise ValueError("module_b selects module_a branches and requires module_a: true.")
+    if config["error_refinement_mode"] not in ("gated", "auxiliary", "plain"):
+        raise ValueError("error_refinement_mode must be gated, auxiliary or plain.")
+    error_width = config["error_refinement_channels"]
+    if type(error_width) is not int or error_width < 4 or error_width % 4:
+        raise ValueError("error_refinement_channels must be positive, at least four and divisible by four.")
+    for key in ("error_max_correction", "error_risk_weight"):
+        value = config[key]
+        if type(value) not in (int, float) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{key} must be finite and positive.")
+    weight = config["error_coarse_weight"]
+    if type(weight) not in (int, float) or not math.isfinite(weight) or not 0 <= weight < 1:
+        raise ValueError("error_coarse_weight must be finite and in [0, 1).")
+    if config["error_refinement"]:
+        if any(config[key] for key in ("module_a", "module_b", "encoder_unravel", "encoder_discrimination", "dual_encoder")):
+            raise ValueError("Error refinement experiments require legacy A/B, Unravel, discrimination and dual encoder OFF.")
+        if config["spectral_refinement"] != "off" or config["loss"] == "cross_entropy_contrastive":
+            raise ValueError("Error refinement experiments require spectral refinement and contrastive training OFF.")
     width = config["unravel_channels"]
     if type(width) is not int or width < 16 or width % 4:
         raise ValueError("unravel_channels must be at least 16 and divisible by four.")

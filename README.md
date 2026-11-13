@@ -2,7 +2,105 @@
 
 用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion、MiT/ResNet-50 双编码器及高分辨率恢复、前景／背景判别分支；旧实验保留用于复现。
 
-## F2 编码器轻量适配模块
+## 显式误报／漏检纠错分支（当前实验）
+
+保留 B0、现有渐进解码器、可学习上采样和 FreqFusion，关闭 F2 适配、旧 A/B、
+前景背景判别和双编码器。本分支是待验证的自定义方案，并非 PUGNet 的移植或论文复现。
+无需增加环境依赖，也不保证精度收益。
+
+模型先产生初始分割分数；将 F1（浅层细节）、F4（深层语义）各自投影并对齐到输入尺寸，
+与停止梯度的初始前景概率拼接，经过轻量卷积预测两张错误风险图。
+FP 头只在初始预测为前景的像素上学习误报风险；FN 头只在初始预测为背景的像素上学习漏检风险。
+预测域由 `argmax` 决定，相等分数归背景，训练与推理一致。
+
+训练标签由停止梯度的初始预测与已有训练标注自动比较生成，无需新增人工标注。
+每个风险头分别对错误／正确像素计算 BCE 均值，再平均实际存在的两组，最后平均有效头；
+没有错误、没有某个预测域或忽略像素均有显式处理。风险分数是类别平衡监督后的评分，
+**不能视为校准后的错误概率**。前向计算、验证推理和实际预测都不使用标注来生成风险图或修正量。
+
+纠错头输出两个非负幅度：在初始前景中，FP 风险控制降低前景分数；在初始背景中，
+FN 风险控制提高前景分数。每个像素的修正限制在正负 4 个 logit 单位，背景分数保持不变。
+修正幅度头从很小的输出开始，不依赖“置信度必须接近 0.5”的选点规则。
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `error_refinement` | `false` | 独立总开关；旧配置和旧检查点默认关闭 |
+| `error_refinement_mode` | `gated` | `gated` 风险引导；`auxiliary` 只监督风险、不纠错；`plain` 普通残差纠错 |
+| `error_refinement_channels` | `32` | 内部通道数，至少 4 且能被 4 整除 |
+| `error_max_correction` | `4.0` | 修正幅度上限，单位为 logit |
+| `error_risk_weight` | `0.1` | 平衡风险 BCE 的权重 |
+| `error_coarse_weight` | `0.2` | 初始 CE 在分割 CE 中的比例 |
+
+主实验目标为 `0.8 * CE(最终) + 0.2 * CE(初始) + 0.1 * Lovasz(最终) + 0.1 * 风险BCE`。
+保留初始分割监督，防止其失去意义；总 CE 系数仍为 1。`auxiliary` 模式初始／最终预测完全相同，
+两项 CE 合起来等于原 CE。`plain` 与 `gated` 的训练层、参数量和损失一致，
+但修正量不读取风险图、不按初始类别门控，用来检验风险引导是否优于普通额外卷积。
+新分支使用解码器学习率 `6e-4`；原 MiT 使用 `6e-5`。
+
+实际 B0 实例参数：原轻量组合 5,601,432，加入 `gated` 后 5,616,828；
+新增 15,396（约 0.27%）。参数统计不等于 GFLOPs 或推理耗时。
+
+| 实验 | 配置 |
+| --- | --- |
+| 已有轻量参考，不加纠错 | `configs/segformer_b0_decoder_freqfusion_lovasz.yaml` |
+| 完整风险引导纠错，先跑这一组 | `configs/segformer_b0_decoder_freqfusion_error_refinement.yaml` |
+| 仅风险辅助监督 | `configs/segformer_b0_decoder_freqfusion_error_auxiliary.yaml` |
+| 同参数普通纠错对照 | `configs/segformer_b0_decoder_freqfusion_error_plain.yaml` |
+
+这些配置保持 NIR/R/G、ImageNet MiT-B0、100 轮、batch size 8、seed 42 和原数据划分。
+总开关也支持原版 MLP 解码器，与解码器、FreqFusion 开关独立。
+首次训练从相同来源的 ImageNet 权重开始，新分支随机初始化；不要用旧实验的 `--resume` 启动新结构。
+
+```bash
+cd /root/segformer
+source /etc/network_turbo
+git pull --ff-only
+
+# Requires the complete MiT-B0 cache already used by earlier experiments.
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+RUN=outputs/gf16m_decoder_freqfusion_error_refinement_lovasz_s42
+
+python train.py \
+  --config configs/segformer_b0_decoder_freqfusion_error_refinement.yaml \
+  --output-dir "$RUN"
+
+python evaluate.py --data-root dataset --checkpoint "$RUN/checkpoints/best.pt" \
+  --split val --output-dir "$RUN/evaluation/val"
+
+python evaluate.py --data-root dataset --checkpoint "$RUN/checkpoints/best.pt" \
+  --split test --output-dir "$RUN/evaluation/test"
+
+python predict.py --checkpoint "$RUN/checkpoints/best.pt" \
+  --input dataset/images/test --mask-dir dataset/masks/test \
+  --save-probabilities --save-error-maps --output-dir "$RUN/predictions/test"
+```
+
+若权重位于独立本地目录，在训练命令追加 `--pretrained-model /root/models/mit-b0`（按实际路径替换）。
+中断后执行 `python train.py --resume outputs/gf16m_decoder_freqfusion_error_refinement_lovasz_s42/checkpoints/last.pt`。
+固定评估／预测输出目录只能首次使用；重复导出请省略 `--output-dir` 自动生成时间戳目录。
+
+训练记录新增初始 CE、风险 BCE、FP/FN 监督像素数、验证初始 IoU、风险 AP 和改对／改错像素数。
+`error_diagnostics/val_epoch_*.json` 保存各轮验证诊断，`best.pt` 仍按最终预测的验证前景 IoU 选择。
+评估 `metrics.json` 是最终分割指标；旁边的 `error_diagnostics.json` 包含初始／最终指标、
+改对错误数、改坏正确像素数，以及学习风险与初始熵的定位 AP 对比。
+FP AP 仅在初始前景内计算，FN AP 仅在初始背景内计算；AP 使用 2048 桶近似，并非精确排序 AP。
+诊断中的“改对”不等于增加相同数量的前景 TP，需结合 IoU、精确率和召回率判断。
+
+预测的 `--save-error-maps` 额外保存 float32 TIFF：`coarse_probabilities/`、`fp_risk_scores/`、
+`fn_risk_scores/`、`logit_corrections/`。风险文件保留原始评分，分析时需限制到对应的初始预测域。
+提供 `--mask-dir` 才会计算预测诊断；标注不参与模型前向。普通预测图片仍在 `masks/`、
+`overlays/`、`comparisons/`，最终前景概率仍在 `probabilities/`。
+后续结构选择优先使用验证集，测试集用于固定方案的最终报告。
+
+设计动机参考 [PUGNet（ISPRS JPRS 2026）](https://doi.org/10.1016/j.isprsjprs.2026.01.010)
+的上下文不确定性细化、[MedIA 2025 标签细化研究](https://doi.org/10.1016/j.media.2024.103355)
+的显式纠错训练，以及 [TIP 2026 一致性不确定性研究](https://doi.org/10.1109/TIP.2026.3732294)
+对高置信度错误的讨论。本实现不移植它们的原始模块、医学结构先验、域适应训练或对比损失；
+这些论文没有证明本方案对马尾藻有效，也不能替代后续消融及创新性论证。
+
+## 历史实验：F2 编码器轻量适配模块
 
 仅在 MiT **Stage 2 的输出归一化之后**插入一个 UnravelNet 机制适配模块 E。
 增强后的 F2 同时送往 Stage 3 和解码器；F1 不变，F3/F4 由新的 F2 继续提取。

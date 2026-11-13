@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 from .contrastive import HardAlgaeContrastiveLoss
+from .error_diagnostics import ErrorDiagnostics
+from .error_refinement import balanced_error_loss
 from .lovasz import foreground_lovasz_loss
 from .metrics import confusion_matrix, metrics_from_confusion
 
@@ -56,8 +58,23 @@ def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion,
         lovasz_loss = foreground_lovasz_loss(logits, masks)
         if lovasz_loss is not None:
             loss = loss + lovasz_weight * lovasz_loss
+    error_risk_loss, error_coarse_loss = None, None
+    error_counts = None
+    coarse_logits = getattr(outputs, "coarse_logits", None)
+    if coarse_logits is not None:
+        settings = model.config.local_refinement
+        if coarse_logits.shape[-2:] != masks.shape[-2:]:
+            coarse_logits = F.interpolate(coarse_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+        error_coarse_loss = criterion(coarse_logits, masks)
+        error_risk_loss, error_counts = balanced_error_loss(outputs.error_logits, coarse_logits, masks)
+        # Preserve total CE coefficient=1; in auxiliary-only mode coarse and
+        # final logits coincide, so this mix is exactly the original CE.
+        loss = loss + settings["error_coarse_weight"] * (error_coarse_loss - main_loss)
+        loss = loss + settings["error_risk_weight"] * error_risk_loss
     return {"loss": loss, "main_loss": main_loss, "auxiliary_loss": auxiliary_loss,
-            "auxiliary_weight": weight, "contrastive_loss": contrastive_loss, "lovasz_loss": lovasz_loss}
+            "auxiliary_weight": weight, "contrastive_loss": contrastive_loss, "lovasz_loss": lovasz_loss,
+            "error_risk_loss": error_risk_loss, "error_coarse_loss": error_coarse_loss,
+            "error_counts": error_counts}
 
 
 def train_epoch(model, loader, optimizer, criterion, device: torch.device,
@@ -71,6 +88,8 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
     total_main_loss, total_auxiliary_loss = 0.0, 0.0
     total_contrastive_loss, contrastive_batches = 0.0, 0
     total_lovasz_loss, lovasz_batches = 0.0, 0
+    total_error_risk, total_error_coarse = 0.0, 0.0
+    error_counts = np.zeros(2, dtype=np.int64)
     num_images = 0
     bar = tqdm(loader, desc=f"Train {epoch}/{total_epochs}", disable=not sys.stderr.isatty())
     for step, batch in enumerate(bar, start=1):
@@ -93,6 +112,10 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
         if losses["lovasz_loss"] is not None:
             total_lovasz_loss += losses["lovasz_loss"].item() * images.size(0)
             lovasz_batches += 1
+        if losses["error_risk_loss"] is not None:
+            total_error_risk += losses["error_risk_loss"].item() * images.size(0)
+            total_error_coarse += losses["error_coarse_loss"].item() * images.size(0)
+            error_counts += losses["error_counts"].detach().cpu().numpy()
         num_images += images.size(0)
         bar.set_postfix(loss=f"{total_loss / num_images:.5f}", lr=f"{optimizer.param_groups[0]['lr']:.2g}")
         if step == 1 or step % log_every == 0 or step == len(loader):
@@ -113,11 +136,18 @@ def train_epoch(model, loader, optimizer, criterion, device: torch.device,
                 logger.info("Loss components | main CE %.6f | foreground Lovasz %.6f | weight %.3g | active batches %s/%s",
                             total_main_loss / num_images, total_lovasz_loss / num_images,
                             lovasz_weight, lovasz_batches, step)
+            if losses["error_risk_loss"] is not None:
+                logger.info("Error refinement | final CE %.6f | initial CE %.6f | risk BCE %.6f | FP/FN targets %s/%s",
+                            total_main_loss / num_images, total_error_coarse / num_images,
+                            total_error_risk / num_images, int(error_counts[0]), int(error_counts[1]))
     return {"loss": total_loss / num_images, "main_loss": total_main_loss / num_images,
             "auxiliary_loss": total_auxiliary_loss / num_images,
             "contrastive_loss": total_contrastive_loss / num_images,
             "contrastive_batches": contrastive_batches,
             "lovasz_loss": total_lovasz_loss / num_images, "lovasz_batches": lovasz_batches,
+            "error_risk_loss": total_error_risk / num_images,
+            "error_coarse_loss": total_error_coarse / num_images,
+            "error_fp_targets": int(error_counts[0]), "error_fn_targets": int(error_counts[1]),
             "seconds": time.monotonic() - started}
 
 
@@ -131,11 +161,21 @@ def evaluate_model(model, loader, device: torch.device, criterion=None,
     confusion = np.zeros((2, 2), dtype=np.int64)
     per_image, samples = [], []
     total_loss, num_images = 0.0, 0
+    error_diagnostics = None
     bar = tqdm(loader, desc=description, disable=not sys.stderr.isatty())
     for step, batch in enumerate(bar, start=1):
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
-        logits = resized_logits(model, images, masks.shape[-2:])
+        outputs = model(pixel_values=images)
+        logits = outputs.logits
+        if logits.shape[-2:] != masks.shape[-2:]:
+            logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+        if getattr(outputs, "coarse_logits", None) is not None:
+            if error_diagnostics is None:
+                error_diagnostics = ErrorDiagnostics()
+            coarse = F.interpolate(outputs.coarse_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+            risk = F.interpolate(outputs.error_logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
+            error_diagnostics.update(coarse, logits, risk, masks)
         if criterion is not None:
             loss_value = criterion(logits, masks).item()
             if not math.isfinite(loss_value):
@@ -160,4 +200,5 @@ def evaluate_model(model, loader, device: torch.device, criterion=None,
     return {"metrics": metrics_from_confusion(confusion), "confusion": confusion,
             "per_image": per_image, "samples": samples, "num_images": num_images,
             "loss": total_loss / num_images if criterion is not None else None,
+            "error_diagnostics": error_diagnostics.report() if error_diagnostics is not None else None,
             "seconds": time.monotonic() - started}

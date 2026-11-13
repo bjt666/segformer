@@ -104,6 +104,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant += f"-discrimination-{config['discrimination_mode']}"
         if config["encoder_unravel"]:
             variant += "-unravel-f2"
+        if config["error_refinement"]:
+            variant += f"-error-{config['error_refinement_mode']}"
         if config["dual_encoder"]:
             variant += f"-dual-interaction{int(config['dual_interaction'])}-highres{int(config['dual_highres'])}"
         if config["loss"] == "cross_entropy_contrastive":
@@ -183,11 +185,17 @@ def main() -> None:
                     "new adapter lr %.3g; pretrained MiT lr %.3g | no auxiliary loss",
                     config["unravel_channels"], config["unravel_quality_channels"], config["unravel_kernel"],
                     config["decoder_lr"], config["encoder_lr"])
+    if config["error_refinement"]:
+        logger.info("Error refinement mode=%s width=%s | CE mix: %.3g final + %.3g initial | "
+                    "balanced FP/FN risk BCE weight %.3g | max correction %.3g logits | branch lr %.3g",
+                    config["error_refinement_mode"], config["error_refinement_channels"],
+                    1 - config["error_coarse_weight"], config["error_coarse_weight"],
+                    config["error_risk_weight"], config["error_max_correction"], config["decoder_lr"])
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=config["epochs"])
     criterion = nn.CrossEntropyLoss()
     lovasz_weight = config["lovasz_weight"] if config["loss"] == "cross_entropy_lovasz" else 0.0
     if lovasz_weight:
-        logger.info("Training objective | main CE + %.3g * batch foreground Lovasz", lovasz_weight)
+        logger.info("Foreground Lovasz weight %.3g; applied to final logits in addition to the CE objective", lovasz_weight)
     contrastive = None
     if config["loss"] == "cross_entropy_contrastive":
         contrastive = HardAlgaeContrastiveLoss(config)
@@ -290,6 +298,24 @@ def main() -> None:
                         "train_lovasz_loss": train_result["lovasz_loss"],
                         "train_lovasz_weight": lovasz_weight,
                         "train_lovasz_batches": train_result["lovasz_batches"]})
+        if config["error_refinement"]:
+            diagnostic = val_result["error_diagnostics"]
+            row.update({"train_main_loss": train_result["main_loss"],
+                        "train_error_coarse_ce": train_result["error_coarse_loss"],
+                        "train_error_risk_loss": train_result["error_risk_loss"],
+                        "train_error_fp_targets": train_result["error_fp_targets"],
+                        "train_error_fn_targets": train_result["error_fn_targets"],
+                        "train_error_risk_weight": config["error_risk_weight"],
+                        "train_error_coarse_weight": config["error_coarse_weight"],
+                        "val_coarse_foreground_iou": diagnostic["coarse_metrics"]["foreground_iou"],
+                        "val_corrected_error_pixels": diagnostic["corrected_error_pixels"],
+                        "val_spoiled_correct_pixels": diagnostic["spoiled_correct_pixels"],
+                        "val_fp_risk_ap": diagnostic["risk_localization"]["false_positive"]["learned_risk"]["average_precision_histogram"],
+                        "val_fn_risk_ap": diagnostic["risk_localization"]["false_negative"]["learned_risk"]["average_precision_histogram"]})
+            write_json(output / "error_diagnostics" / f"val_epoch_{epoch:04d}.json", diagnostic)
+            logger.info("Validation correction | initial IoU %s -> final %.6f | corrected errors %s | spoiled correct %s",
+                        row["val_coarse_foreground_iou"], val_iou,
+                        row["val_corrected_error_pixels"], row["val_spoiled_correct_pixels"])
         history.append(row)
         payload = make_checkpoint(model, optimizer, scheduler, epoch, best_iou, best_epoch,
                                   config, mean, std, history, manifest, generators, environment)

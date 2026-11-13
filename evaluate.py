@@ -57,6 +57,12 @@ def main() -> None:
               "loss": result["loss"], **result["metrics"],
               "confusion_matrix": result["confusion"].tolist(), "metric_policy": METRIC_POLICY}
     write_json(output / "metrics.json", report)
+    if result["error_diagnostics"] is not None:
+        write_json(output / "error_diagnostics.json", {
+            "split": args.split, "num_images": result["num_images"],
+            "checkpoint_sha256": report["checkpoint_sha256"], "checkpoint_epoch": report["checkpoint_epoch"],
+            **result["error_diagnostics"],
+        })
     write_csv(output / "per_image_metrics.csv", result["per_image"])
     write_csv(output / "confusion_matrix.csv", [
         {"ground_truth": "background", "predicted_background": int(result["confusion"][0, 0]),

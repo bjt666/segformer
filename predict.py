@@ -15,6 +15,7 @@ from tqdm import tqdm
 from segformer_baseline.checkpoint import input_bands_from_checkpoint, load_checkpoint, preprocessing_from_checkpoint
 from segformer_baseline.dataset import file_sha256, image_files, normalize_image, read_image, read_mask
 from segformer_baseline.engine import resized_logits
+from segformer_baseline.error_diagnostics import ErrorDiagnostics
 from segformer_baseline.metrics import METRIC_POLICY, confusion_matrix, metrics_from_confusion
 from segformer_baseline.model import model_architecture, model_from_checkpoint, model_parameter_counts
 from segformer_baseline.utils import collect_environment, resolve_device, setup_logger, write_csv, write_json
@@ -30,6 +31,8 @@ def main() -> None:
     parser.add_argument("--output-dir", type=Path)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--save-probabilities", action="store_true", help="Save foreground probability as float32 TIFF")
+    parser.add_argument("--save-error-maps", action="store_true",
+                        help="For error-refinement models, save initial probabilities, FP/FN risk scores and logit corrections")
     parser.add_argument("--log-every", type=int, default=20)
     args = parser.parse_args()
     if args.log_every < 1:
@@ -55,12 +58,20 @@ def main() -> None:
     logger = setup_logger(output / "predict.log")
     model = model_from_checkpoint(checkpoint).to(device)
     model.eval()
+    has_error_refinement = model_architecture(model)["error_refinement"]
+    if args.save_error_maps and not has_error_refinement:
+        parser.error("--save-error-maps requires an error_refinement checkpoint")
+    error_diagnostics = ErrorDiagnostics() if has_error_refinement and args.mask_dir else None
     per_image, input_records = [], []
     confusion = np.zeros((2, 2), dtype=np.int64)
     for index, path in enumerate(tqdm(paths, desc="Predict", disable=not sys.stderr.isatty()), start=1):
         image = read_image(path)
         tensor = normalize_image(image, channels, mean, std).unsqueeze(0).to(device)
-        logits = resized_logits(model, tensor, image.shape[:2])
+        if has_error_refinement:
+            outputs = model(pixel_values=tensor)
+            logits = outputs.logits
+        else:
+            logits = resized_logits(model, tensor, image.shape[:2])
         # Match evaluate.py exactly: argmax assigns class 0 on equal logits.
         prediction = logits.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
         target = read_mask(args.mask_dir / path.name, image.shape[:2]) if args.mask_dir else None
@@ -71,12 +82,24 @@ def main() -> None:
             confusion += matrix
             per_image.append({"name": path.name, **metrics_from_confusion(matrix)})
             record["mask_sha256"] = file_sha256(args.mask_dir / path.name)
+            if error_diagnostics is not None:
+                error_diagnostics.update(outputs.coarse_logits, logits, outputs.error_logits,
+                                         torch.from_numpy(target).unsqueeze(0).to(device))
         input_records.append(record)
         if args.save_probabilities:
             probability = logits.softmax(dim=1)[0, 1].cpu().numpy().astype(np.float32)
             probability_path = output / "probabilities" / path.name
             probability_path.parent.mkdir(parents=True, exist_ok=True)
             tifffile.imwrite(probability_path, probability)
+        if args.save_error_maps:
+            maps = {"coarse_probabilities": outputs.coarse_logits.softmax(dim=1)[0, 1],
+                    "fp_risk_scores": outputs.error_logits.sigmoid()[0, 0],
+                    "fn_risk_scores": outputs.error_logits.sigmoid()[0, 1],
+                    "logit_corrections": outputs.logit_correction[0, 0]}
+            for category, values in maps.items():
+                destination = output / category / path.name
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                tifffile.imwrite(destination, values.cpu().numpy().astype(np.float32))
         if index == 1 or index % args.log_every == 0 or index == len(paths):
             logger.info("Predicted %s/%s: %s", index, len(paths), path.name)
     report = {"num_images": len(paths), "checkpoint": str(args.checkpoint.resolve()),
@@ -85,6 +108,10 @@ def main() -> None:
               "input_bands": input_bands_from_checkpoint(checkpoint),
               "architecture": model_architecture(model), "parameter_counts": model_parameter_counts(model),
               "mask_encoding": {"background": 0, "target": 255}, "probabilities_saved": args.save_probabilities,
+              "error_maps_saved": args.save_error_maps,
+              "error_map_policy": "FP scores apply only where initial argmax is foreground; FN scores only where "
+                  "it is background. Raw sigmoid risk scores are saved and are not calibrated probabilities. "
+                  "Correction is added to the foreground logit; negative suppresses, positive increases foreground.",
               "display": "NIR,R,G with per-image per-channel 2nd/98th percentile stretch; display only",
               "georeferencing": "Pixel dimensions are preserved; GeoTIFF spatial metadata is not copied.",
               "inputs": input_records}
@@ -92,6 +119,11 @@ def main() -> None:
         report.update({"metrics": metrics_from_confusion(confusion), "confusion_matrix": confusion.tolist(),
                        "metric_policy": METRIC_POLICY})
         write_csv(output / "per_image_metrics.csv", per_image)
+        if error_diagnostics is not None:
+            write_json(output / "error_diagnostics.json", {
+                "checkpoint_sha256": report["checkpoint_sha256"], "checkpoint_epoch": report["checkpoint_epoch"],
+                **error_diagnostics.report(),
+            })
     write_json(output / "prediction_manifest.json", report)
     write_json(output / "environment.json", collect_environment(Path(__file__).resolve().parent, device))
     logger.info("Prediction masks and visualizations saved to %s", output.resolve())

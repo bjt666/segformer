@@ -72,6 +72,11 @@ def main():
                   "peak_reserved_mib": torch.cuda.max_memory_reserved(device) / 1024**2 if device.type == "cuda" else None}
         if lovasz_weight:
             report["lovasz_loss"] = losses["lovasz_loss"].item()
+        if config["error_refinement"]:
+            report.update({"error_mode": config["error_refinement_mode"],
+                           "error_risk_loss": losses["error_risk_loss"].item(),
+                           "error_coarse_ce": losses["error_coarse_loss"].item(),
+                           "error_fp_fn_targets": losses["error_counts"].tolist()})
         print(json.dumps(report, indent=2))
     except torch.cuda.OutOfMemoryError:
         raise SystemExit("CUDA memory insufficient for this batch. Try a smaller --batch-size in this check; "

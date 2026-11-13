@@ -11,6 +11,7 @@ from transformers import SegformerConfig, SegformerForImageClassification, Segfo
 from .config import DEFAULTS, default_config, validate_config
 from .decoder import DecoderHead, DecoderSegformerForSemanticSegmentation
 from .discrimination import DiscriminativeEncoder, DiscriminationSegformerForSemanticSegmentation
+from .error_refinement import ErrorRefinement, ErrorRefinementSegformer
 from .hybrid import DualEncoder, DualSegformerForSemanticSegmentation, HighResolutionFusion
 from .refinement import RefinedDecodeHead
 from .unravel import UnravelEncoder
@@ -29,6 +30,8 @@ ARCHITECTURE_FIELDS = (
     "dual_highres_blocks", "dual_residual_scale",
     "encoder_unravel", "unravel_channels", "unravel_kernel",
     "unravel_quality_channels", "unravel_residual_scale",
+    "error_refinement", "error_refinement_mode", "error_refinement_channels",
+    "error_max_correction", "error_risk_weight", "error_coarse_weight",
 )
 
 
@@ -122,6 +125,7 @@ def model_parameter_counts(model) -> dict:
             "high_resolution_branch": highres, "high_resolution_fusion": highres_fusion,
             "encoder_discrimination": discrimination,
             "encoder_unravel": unravel,
+            "error_refinement": count(model.error_refinement) if hasattr(model, "error_refinement") else 0,
             "decoder": decoder, "original_decoder": original_decoder,
             "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion,
             "spectral_refinement": spectral_refinement}
@@ -140,6 +144,8 @@ def optimizer_parameter_groups(model, config: dict) -> list[dict]:
         new_parameters.extend(model.segformer.encoder.unravel.parameters())
     if isinstance(model.segformer.encoder, DualEncoder):
         new_parameters.extend(model.segformer.encoder.new_parameters())
+    if hasattr(model, "error_refinement"):
+        new_parameters.extend(model.error_refinement.parameters())
     new_ids = {id(parameter) for parameter in new_parameters}
     backbone = [parameter for parameter in model.segformer.parameters() if id(parameter) not in new_ids]
     decoder_and_branch = list(model.decode_head.parameters()) + new_parameters
@@ -182,10 +188,19 @@ def _attach_architecture(model, architecture: dict) -> None:
                     architecture["upsample_channels"][0], architecture["dual_highres_channels"],
                     architecture["dual_residual_scale"],
                 )
+    if architecture["error_refinement"]:
+        if model.config.num_labels != 2 or not model.config.reshape_last_stage:
+            raise ValueError("Error refinement requires binary segmentation and four native spatial encoder stages.")
+        with torch.random.fork_rng(devices=[]):
+            model.error_refinement = ErrorRefinement(
+                model.config.hidden_sizes, architecture["error_refinement_channels"],
+                architecture["error_refinement_mode"], architecture["error_max_correction"],
+            )
 
 
 def _new_model(model_config: SegformerConfig, architecture: dict) -> SegformerForSemanticSegmentation:
-    model_class = (DualSegformerForSemanticSegmentation if architecture["dual_encoder"]
+    model_class = (ErrorRefinementSegformer if architecture["error_refinement"]
+                   else DualSegformerForSemanticSegmentation if architecture["dual_encoder"]
                    else DiscriminationSegformerForSemanticSegmentation if architecture["encoder_discrimination"]
                    else DecoderSegformerForSemanticSegmentation if _uses_custom_decoder(architecture)
                    else SegformerForSemanticSegmentation)

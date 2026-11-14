@@ -23,6 +23,7 @@ from segformer_baseline.config import (
 from segformer_baseline.contrastive import HardAlgaeContrastiveLoss
 from segformer_baseline.dataset import PairedTiffDataset, build_manifest, compute_train_stats
 from segformer_baseline.engine import evaluate_model, train_epoch
+from segformer_baseline.input_scale import INPUT_SCALE_POLICY, checkpoint_input_scale
 from segformer_baseline.model import (
     architecture_from_config, build_model, checkpoint_architecture,
     checkpoint_model_signature, model_architecture, model_from_checkpoint, model_parameter_counts,
@@ -43,7 +44,7 @@ def parse_args() -> argparse.Namespace:
         parser.add_argument("--" + field.replace("_", "-"), type=Path)
     for field in ("epochs", "batch_size", "num_workers", "seed", "log_every", "visualization_samples"):
         parser.add_argument("--" + field.replace("_", "-"), type=int)
-    for field in ("encoder_lr", "decoder_lr", "weight_decay", "lovasz_weight"):
+    for field in ("encoder_lr", "decoder_lr", "weight_decay", "lovasz_weight", "input_scale"):
         parser.add_argument("--" + field.replace("_", "-"), type=float)
     parser.add_argument("--device")
     parser.add_argument("--pretrained-model")
@@ -72,6 +73,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
         # Old schema-2 runs lack the new optional architecture switches.
         config = default_config()
         config.update(checkpoint["config"])
+        if config["input_scale"] != checkpoint_input_scale(checkpoint):
+            raise ValueError("Saved training input_scale does not match the checkpoint preprocessing metadata.")
         if architecture_from_config(config) != checkpoint_architecture(checkpoint):
             raise ValueError("Saved training settings do not match the checkpoint architecture.")
         if args.resume.parent.name == "checkpoints":
@@ -112,6 +115,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant += "-hard-algae-contrastive"
         elif config["loss"] == "cross_entropy_lovasz":
             variant += "-foreground-lovasz"
+        if config["input_scale"] != 1:
+            variant += f"-scale{config['input_scale']:g}"
         config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())
@@ -134,6 +139,8 @@ def main() -> None:
     logger = setup_logger(output / "train.log")
     logger.info("Experiment directory: %s", output)
     logger.info("Input bands %s from source indices %s; device %s", config["input_bands"], config["input_channels"], device)
+    logger.info("Input scale %.3g | model input is interpolated; original masks, loss and metric grids are retained. %s",
+                config["input_scale"], INPUT_SCALE_POLICY)
     if checkpoint and config["num_workers"] != checkpoint["config"]["num_workers"]:
         logger.warning("num_workers changed. Augmentation RNG sequences may differ from the original run.")
     set_seed(config["seed"])
@@ -167,6 +174,7 @@ def main() -> None:
     logger.info("Model parameters: %s", parameter_counts)
     write_json(output / "architecture.json", architecture)
     write_json(output / "model_summary.json", {"architecture": architecture,
+               "input_scale": config["input_scale"], "input_scale_policy": INPUT_SCALE_POLICY,
                "hidden_sizes": list(model.config.hidden_sizes),
                "decoder_hidden_size": model.config.decoder_hidden_size,
                "parameter_counts": parameter_counts})
@@ -225,6 +233,7 @@ def main() -> None:
     save_config(config, output / "config.yaml")
     write_json(output / "run_config.json", config)
     write_json(output / "preprocessing.json", {"source_order": ["B", "G", "R", "NIR"],
+               "input_scale": config["input_scale"], "input_scale_policy": INPUT_SCALE_POLICY,
                "input_channels": list(channels), "input_bands": config["input_bands"],
                "mean": mean.tolist(), "std": std.tolist(), "statistics_split": "train"})
     write_json(output / "dataset_manifest.json", manifest)

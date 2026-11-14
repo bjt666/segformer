@@ -2,7 +2,86 @@
 
 用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion、MiT/ResNet-50 双编码器及高分辨率恢复、前景／背景判别分支；旧实验保留用于复现。
 
-## 显式误报／漏检纠错分支（当前实验）
+## 输入尺度对照：512 输入、原图网格监督（当前实验）
+
+本轮只验证输入采样密度，不接入完整双尺度网络。参考仍为
+`configs/segformer_b0_decoder_freqfusion_lovasz.yaml`，新配置为
+`configs/segformer_b0_decoder_freqfusion_lovasz_scale2.yaml`。
+两者合并默认值后只差 `input_scale: 1.0` 与 `input_scale: 2.0`，
+保留相同 B0、渐进解码器、可学习上采样、FreqFusion、预训练和 `CE + 0.1 * foreground Lovasz`。
+旧 A/B、F2 适配、判别、双编码器、光谱修正和错误纠正全部关闭。
+
+统一前向入口在训练增强和原始训练像素归一化之后，将图像按双线性插值放大：
+`align_corners=False`、`antialias=False`，尺寸按四舍五入（半数向上）确定。
+原始 256×256 图像对应 512×512 模型输入；原 TIFF 和标注文件均不改写。
+模型输出的**原始 logits**先双线性缩回标注的原256×256网格，再计算 CE、Lovasz、softmax 或 argmax。
+标注不放大、不平滑，所有指标、概率和预测图片保持原像素尺寸。
+这是单输入尺度对照，不是测试时多尺度集成，也不会创造额外的卫星观测信息。
+
+| 配置项 | 默认值 | 作用 |
+| --- | --- | --- |
+| `input_scale` | `1.0` | 正数且不超过4；本轮设为2。默认1直接沿用旧前向路径 |
+
+尺度不增加模型层或参数，总参数仍为 **5,601,432**。新配置沿用100轮、batch size 8、
+seed 42、编码器 `6e-5`／解码器 `6e-4`、ImageNet MiT-B0初始化。
+首次训练不用旧分割权重续训，不需要重跑已有256输入参考实验。
+放大输入增加显存和计算，不能只根据参数量评价开销；`check_model.py` 同时打印原图尺寸和实际模型输入尺寸。
+
+`input_scale` 保存到训练配置、模型配置和检查点，并检查它们的一致性。
+评估和预测自动采用检查点尺度；旧检查点缺省为1，恢复训练时禁止修改尺度。
+外部自行调用原始 HF `model.forward` 不会自动插值，需使用本项目统一入口
+`forward_with_input_scale` 或 `resized_logits`，避免漏缩放或重复放大。
+
+服务器首次运行：
+
+```bash
+cd /root/segformer
+source /etc/network_turbo
+git pull --ff-only
+export HF_HUB_OFFLINE=1
+export TRANSFORMERS_OFFLINE=1
+
+RUN=outputs/gf16m_decoder_freqfusion_lovasz_scale2_s42
+
+python check_model.py --config configs/segformer_b0_decoder_freqfusion_lovasz_scale2.yaml
+
+python train.py --config configs/segformer_b0_decoder_freqfusion_lovasz_scale2.yaml \
+  --output-dir "$RUN"
+
+for SPLIT in val test; do
+  python evaluate.py --data-root dataset --checkpoint "$RUN/checkpoints/best.pt" \
+    --split "$SPLIT" --output-dir "$RUN/evaluation/$SPLIT"
+done
+
+python predict.py --checkpoint "$RUN/checkpoints/best.pt" \
+  --input dataset/images/val --mask-dir dataset/masks/val \
+  --save-probabilities --output-dir "$RUN/predictions/val"
+
+python export_analysis.py --run-dir "$RUN"
+```
+
+离线训练需要之前实验已有的完整 MiT-B0 缓存；若存放在独立目录，训练命令追加
+`--pretrained-model /root/models/mit-b0`（按实际路径替换）。中断后执行：
+
+```bash
+python train.py --resume outputs/gf16m_decoder_freqfusion_lovasz_scale2_s42/checkpoints/last.pt
+```
+
+固定评估／预测目录用于首次导出，重复运行不能覆盖已有结果。恢复完成后，
+请确保评估和预测针对当前 `best.pt`；打包会核查权重指纹、数据指纹和尺度一致性。
+
+分析只需下载本实验目录中的 **`analysis_bundle.zip`**。压缩包按原目录结构保存：
+
+- `metrics.csv`、`config.yaml`、`environment.json`、`dataset_manifest.json`、`preprocessing.json`。
+- `evaluation/val/` 下的 `metrics.json` 和 `per_image_metrics.csv`。
+- `evaluation/test/` 下的 `metrics.json`、`per_image_metrics.csv` 和 `dataset_manifest.json`。
+- `predictions/val/prediction_manifest.json` 和全部验证集 `probabilities/*.tif`。
+
+共11个小文件及87张验证集概率图（按当前GF16m划分）。不打包权重、原始数据集、
+逐轮预览、曲线PNG、叠加图或重复预测图片。权重继续保留在服务器，用于续训和后续复核。
+分析时以验证集作为结构筛选依据，测试集单独报告；预测和指标均在原256网格上比较。
+
+## 历史实验：显式误报／漏检纠错分支
 
 保留 B0、现有渐进解码器、可学习上采样和 FreqFusion，关闭 F2 适配、旧 A/B、
 前景背景判别和双编码器。本分支是待验证的自定义方案，并非 PUGNet 的移植或论文复现。

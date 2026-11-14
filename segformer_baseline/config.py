@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from .input_scale import validate_input_scale
+
 
 SPECTRAL_REFINEMENT_MODES = ("off", "concat", "local")
 TRAINING_LOSSES = ("cross_entropy", "cross_entropy_contrastive", "cross_entropy_lovasz")
@@ -18,6 +20,7 @@ DEFAULTS: dict[str, Any] = {
     "batch_size": 8, "num_workers": 4, "seed": 42, "device": "cuda",
     "pretrained": True, "pretrained_model": "nvidia/mit-b0",
     "input_channels": [3, 2, 1], "input_bands": ["NIR", "R", "G"],
+    "input_scale": 1.0,
     "encoder_lr": 6e-5, "decoder_lr": 6e-4, "weight_decay": 0.01,
     "loss": "cross_entropy", "log_every": 20, "visualization_samples": 8,
     "lovasz_weight": 0.1,
@@ -65,6 +68,7 @@ def default_config() -> dict[str, Any]:
 
 
 def validate_config(config: dict[str, Any]) -> None:
+    validate_input_scale(config["input_scale"])
     for key in ("epochs", "batch_size", "log_every"):
         if type(config[key]) is not int or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer.")

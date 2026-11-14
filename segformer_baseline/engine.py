@@ -15,15 +15,13 @@ from tqdm import tqdm
 from .contrastive import HardAlgaeContrastiveLoss
 from .error_diagnostics import ErrorDiagnostics
 from .error_refinement import balanced_error_loss
+from .input_scale import forward_with_input_scale, logits_on_grid
 from .lovasz import foreground_lovasz_loss
 from .metrics import confusion_matrix, metrics_from_confusion
 
 
 def resized_logits(model, images: torch.Tensor, size: tuple[int, int]) -> torch.Tensor:
-    logits = model(pixel_values=images).logits
-    if logits.shape[-2:] == tuple(size):
-        return logits
-    return F.interpolate(logits, size=size, mode="bilinear", align_corners=False)
+    return logits_on_grid(forward_with_input_scale(model, images).logits, size)
 
 
 def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion, *,
@@ -32,9 +30,9 @@ def training_losses(model, images: torch.Tensor, masks: torch.Tensor, criterion,
     """Combine segmentation CE and any active training-only supervision."""
     use_contrastive = contrastive is not None and contrastive_weight > 0
     if use_contrastive:
-        outputs = model(pixel_values=images, return_dict=True, return_decoder_features=True)
+        outputs = forward_with_input_scale(model, images, return_dict=True, return_decoder_features=True)
     else:
-        outputs = model(pixel_values=images)
+        outputs = forward_with_input_scale(model, images)
     logits = outputs.logits
     if logits.shape[-2:] != masks.shape[-2:]:
         logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)
@@ -166,7 +164,7 @@ def evaluate_model(model, loader, device: torch.device, criterion=None,
     for step, batch in enumerate(bar, start=1):
         images = batch["image"].to(device, non_blocking=True)
         masks = batch["mask"].to(device, non_blocking=True)
-        outputs = model(pixel_values=images)
+        outputs = forward_with_input_scale(model, images)
         logits = outputs.logits
         if logits.shape[-2:] != masks.shape[-2:]:
             logits = F.interpolate(logits, size=masks.shape[-2:], mode="bilinear", align_corners=False)

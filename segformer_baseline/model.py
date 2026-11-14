@@ -13,6 +13,7 @@ from .decoder import DecoderHead, DecoderSegformerForSemanticSegmentation
 from .discrimination import DiscriminativeEncoder, DiscriminationSegformerForSemanticSegmentation
 from .error_refinement import ErrorRefinement, ErrorRefinementSegformer
 from .hybrid import DualEncoder, DualSegformerForSemanticSegmentation, HighResolutionFusion
+from .input_scale import checkpoint_input_scale, validate_input_scale
 from .refinement import RefinedDecodeHead
 from .unravel import UnravelEncoder
 
@@ -78,6 +79,7 @@ def model_architecture(model) -> dict:
 def checkpoint_model_signature(checkpoint: dict) -> dict:
     """Compare model settings while allowing optional metadata added to old runs."""
     settings = SegformerConfig.from_dict(checkpoint["model_config"]).to_dict()
+    settings["input_scale"] = checkpoint_input_scale(checkpoint)
     for key in ("local_refinement", "architectures", "transformers_version", "_name_or_path"):
         settings.pop(key, None)
     return settings
@@ -217,6 +219,7 @@ def build_model(config: dict) -> SegformerForSemanticSegmentation:
         source = None
         model_config = SegformerConfig()  # Default MiT-B0 architecture.
     model_config.num_channels = len(channels)
+    model_config.input_scale = validate_input_scale(config.get("input_scale", 1.0))
     model_config.num_labels = 2
     model_config.id2label = {0: "background", 1: "target"}
     model_config.label2id = {"background": 0, "target": 1}
@@ -262,7 +265,9 @@ def build_model(config: dict) -> SegformerForSemanticSegmentation:
 
 def model_from_checkpoint(checkpoint: dict) -> SegformerForSemanticSegmentation:
     architecture = checkpoint_architecture(checkpoint)
-    model = _new_model(SegformerConfig.from_dict(checkpoint["model_config"]), architecture)
+    model_config = SegformerConfig.from_dict(checkpoint["model_config"])
+    model_config.input_scale = checkpoint_input_scale(checkpoint)
+    model = _new_model(model_config, architecture)
     _attach_architecture(model, architecture)
     model.load_state_dict(checkpoint["model"])
     return model

@@ -14,6 +14,7 @@ from segformer_baseline.config import TRAINING_LOSSES, default_config, read_conf
 from segformer_baseline.contrastive import HardAlgaeContrastiveLoss
 from segformer_baseline.engine import training_losses
 from segformer_baseline.model import build_model, model_parameter_counts, optimizer_parameter_groups
+from segformer_baseline.input_scale import INPUT_SCALE_POLICY, scaled_size
 from segformer_baseline.utils import resolve_device, set_seed
 
 
@@ -65,6 +66,8 @@ def main():
         if device.type == "cuda":
             torch.cuda.synchronize(device)
         report = {"status": "passed", "batch_size": config["batch_size"], "image_size": args.size,
+                  "input_scale": config["input_scale"], "model_input_size": list(scaled_size((args.size, args.size), config["input_scale"])),
+                  "input_scale_policy": INPUT_SCALE_POLICY,
                   "device": str(device), "loss": losses["loss"].item(),
             "contrastive_loss": losses["contrastive_loss"].item() if contrastive is not None else None,
                   "parameters": model_parameter_counts(model),

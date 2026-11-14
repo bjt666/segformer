@@ -101,9 +101,11 @@ def make_checkpoint(model, optimizer, scheduler, epoch: int, best_iou: float,
                     history: list[dict], manifest: dict, generators: dict,
                     environment: dict) -> dict:
     from .model import model_architecture
+    from .input_scale import model_input_scale
 
     return {
         "schema_version": SCHEMA_VERSION, "model": model.state_dict(),
+        "input_scale": model_input_scale(model),
         "model_config": model.config.to_dict(), "architecture": model_architecture(model),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(), "epoch": epoch,

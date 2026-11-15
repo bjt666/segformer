@@ -17,7 +17,7 @@ from segformer_baseline.dataset import file_sha256, image_files, normalize_image
 from segformer_baseline.engine import resized_logits
 from segformer_baseline.error_diagnostics import ErrorDiagnostics
 from segformer_baseline.input_scale import (
-    INPUT_SCALE_POLICY, forward_with_input_scale, logits_on_grid, model_input_scale, scaled_size,
+    input_scale_policy, forward_with_input_scale, logits_on_grid, model_input_scale, scaled_size,
 )
 from segformer_baseline.metrics import METRIC_POLICY, confusion_matrix, metrics_from_confusion
 from segformer_baseline.model import model_architecture, model_from_checkpoint, model_parameter_counts
@@ -84,6 +84,8 @@ def main() -> None:
         save_prediction_visuals(path, prediction, output, target=target)
         record = {"name": path.name, "sha256": file_sha256(path), "height": image.shape[0], "width": image.shape[1]}
         record["model_input_size"] = list(scaled_size(image.shape[:2], model_input_scale(model)))
+        if model_architecture(model)["shared_scale"] != "off":
+            record["context_input_size"] = list(image.shape[:2])
         if target is not None:
             matrix = confusion_matrix(target, prediction)
             confusion += matrix
@@ -113,7 +115,7 @@ def main() -> None:
               "checkpoint_sha256": file_sha256(args.checkpoint), "checkpoint_epoch": checkpoint.get("epoch"),
               "input": str(args.input.resolve()), "input_channels": list(channels),
               "input_bands": input_bands_from_checkpoint(checkpoint),
-              "input_scale": model_input_scale(model), "input_scale_policy": INPUT_SCALE_POLICY,
+              "input_scale": model_input_scale(model), "input_scale_policy": input_scale_policy(model_architecture(model)),
               "architecture": model_architecture(model), "parameter_counts": model_parameter_counts(model),
               "mask_encoding": {"background": 0, "target": 255}, "probabilities_saved": args.save_probabilities,
               "error_maps_saved": args.save_error_maps,

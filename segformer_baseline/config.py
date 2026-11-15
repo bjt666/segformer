@@ -21,6 +21,7 @@ DEFAULTS: dict[str, Any] = {
     "pretrained": True, "pretrained_model": "nvidia/mit-b0",
     "input_channels": [3, 2, 1], "input_bands": ["NIR", "R", "G"],
     "input_scale": 1.0,
+    "shared_scale": "off", "shared_scale_stages": [2, 3], "shared_scale_width": 32,
     "encoder_lr": 6e-5, "decoder_lr": 6e-4, "weight_decay": 0.01,
     "loss": "cross_entropy", "log_every": 20, "visualization_samples": 8,
     "lovasz_weight": 0.1,
@@ -69,6 +70,26 @@ def default_config() -> dict[str, Any]:
 
 def validate_config(config: dict[str, Any]) -> None:
     validate_input_scale(config["input_scale"])
+    if config["shared_scale"] not in ("off", "plain", "interaction"):
+        raise ValueError("shared_scale must be off, plain or interaction.")
+    stages = config["shared_scale_stages"]
+    if (not isinstance(stages, list) or not stages
+            or any(type(stage) is not int or stage not in (2, 3) for stage in stages)
+            or len(set(stages)) != len(stages)):
+        raise ValueError("shared_scale_stages must contain unique stage numbers from 2 and 3.")
+    width = config["shared_scale_width"]
+    if type(width) is not int or width < 4 or width % 4:
+        raise ValueError("shared_scale_width must be at least four and divisible by four.")
+    if config["shared_scale"] != "off":
+        if config["input_scale"] != 2.0:
+            raise ValueError("Shared-scale experiments require input_scale: 2.0 and native context input.")
+        if any(config[key] for key in ("module_a", "module_b", "encoder_unravel",
+                                      "encoder_discrimination", "dual_encoder", "error_refinement")):
+            raise ValueError("Shared-scale experiments require the other encoder/refinement branches OFF.")
+        if config["spectral_refinement"] != "off" or config["loss"] == "cross_entropy_contrastive":
+            raise ValueError("Shared-scale experiments require spectral/contrastive refinement OFF.")
+        if config["decoder_fusion"] != "progressive" or config["decoder_upsampling"] != "learned":
+            raise ValueError("Shared-scale experiments require progressive fusion and learned upsampling.")
     for key in ("epochs", "batch_size", "log_every"):
         if type(config[key]) is not int or config[key] < 1:
             raise ValueError(f"{key} must be a positive integer.")

@@ -39,9 +39,16 @@ def package_analysis(run_dir: Path, output: Path | None = None) -> dict:
         raise ValueError("Validation, test and prediction reports were generated from different checkpoints.")
     if len({report.get("input_scale", 1.0) for report in reports}) != 1:
         raise ValueError("Validation, test and prediction input scales disagree.")
+    from segformer_baseline.model import architecture_from_config
+    architectures = [architecture_from_config(report.get("architecture", {})) for report in reports]
+    if any(architecture != architectures[0] for architecture in architectures[1:]):
+        raise ValueError("Validation, test and prediction architectures disagree.")
     preprocessing = json.loads((run_dir / "preprocessing.json").read_text(encoding="utf-8"))
     if preprocessing.get("input_scale", 1.0) != reports[0].get("input_scale", 1.0):
         raise ValueError("Training preprocessing and evaluation input scales disagree.")
+    mode = reports[0].get("architecture", {}).get("shared_scale", "off")
+    if preprocessing.get("shared_scale", "off") != mode:
+        raise ValueError("Training preprocessing and evaluation shared-scale modes disagree.")
     best_checkpoint = run_dir / "checkpoints/best.pt"
     if best_checkpoint.is_file():
         digest = hashlib.sha256()

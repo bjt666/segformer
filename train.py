@@ -23,7 +23,7 @@ from segformer_baseline.config import (
 from segformer_baseline.contrastive import HardAlgaeContrastiveLoss
 from segformer_baseline.dataset import PairedTiffDataset, build_manifest, compute_train_stats
 from segformer_baseline.engine import evaluate_model, train_epoch
-from segformer_baseline.input_scale import INPUT_SCALE_POLICY, checkpoint_input_scale
+from segformer_baseline.input_scale import checkpoint_input_scale, input_scale_policy
 from segformer_baseline.model import (
     architecture_from_config, build_model, checkpoint_architecture,
     checkpoint_model_signature, model_architecture, model_from_checkpoint, model_parameter_counts,
@@ -117,6 +117,8 @@ def prepare_config(args: argparse.Namespace, checkpoint: dict | None) -> dict:
             variant += "-foreground-lovasz"
         if config["input_scale"] != 1:
             variant += f"-scale{config['input_scale']:g}"
+        if config["shared_scale"] != "off":
+            variant += f"-shared-{config['shared_scale']}"
         config["output_dir"] = f"outputs/segformer-b0-{variant}-seed{config['seed']}-{stamp}"
     config["data_root"] = str(Path(config["data_root"]).resolve())
     config["output_dir"] = str(Path(config["output_dir"]).resolve())
@@ -140,7 +142,7 @@ def main() -> None:
     logger.info("Experiment directory: %s", output)
     logger.info("Input bands %s from source indices %s; device %s", config["input_bands"], config["input_channels"], device)
     logger.info("Input scale %.3g | model input is interpolated; original masks, loss and metric grids are retained. %s",
-                config["input_scale"], INPUT_SCALE_POLICY)
+                config["input_scale"], input_scale_policy(config))
     if checkpoint and config["num_workers"] != checkpoint["config"]["num_workers"]:
         logger.warning("num_workers changed. Augmentation RNG sequences may differ from the original run.")
     set_seed(config["seed"])
@@ -174,11 +176,16 @@ def main() -> None:
     logger.info("Model parameters: %s", parameter_counts)
     write_json(output / "architecture.json", architecture)
     write_json(output / "model_summary.json", {"architecture": architecture,
-               "input_scale": config["input_scale"], "input_scale_policy": INPUT_SCALE_POLICY,
+               "input_scale": config["input_scale"], "input_scale_policy": input_scale_policy(config),
                "hidden_sizes": list(model.config.hidden_sizes),
                "decoder_hidden_size": model.config.decoder_hidden_size,
                "parameter_counts": parameter_counts})
     optimizer = torch.optim.AdamW(optimizer_parameter_groups(model, config), weight_decay=config["weight_decay"])
+    if config["shared_scale"] != "off":
+        logger.info("Shared MiT at native/2x scales | fusion=%s stages=%s width=%s | "
+                    "one decoder; no auxiliary loss | shared backbone lr %.3g; fusion/decoder lr %.3g",
+                    config["shared_scale"], config["shared_scale_stages"], config["shared_scale_width"],
+                    config["encoder_lr"], config["decoder_lr"])
     if config["dual_encoder"]:
         logger.info("Dual MiT/ResNet-50 | interaction=%s highres=%s | final-head CE only | "
                     "both backbones lr %.3g; new modules and decoder lr %.3g",
@@ -233,7 +240,8 @@ def main() -> None:
     save_config(config, output / "config.yaml")
     write_json(output / "run_config.json", config)
     write_json(output / "preprocessing.json", {"source_order": ["B", "G", "R", "NIR"],
-               "input_scale": config["input_scale"], "input_scale_policy": INPUT_SCALE_POLICY,
+               "input_scale": config["input_scale"], "input_scale_policy": input_scale_policy(config),
+               "shared_scale": config["shared_scale"],
                "input_channels": list(channels), "input_bands": config["input_bands"],
                "mean": mean.tolist(), "std": std.tolist(), "statistics_split": "train"})
     write_json(output / "dataset_manifest.json", manifest)

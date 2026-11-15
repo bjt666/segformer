@@ -2,7 +2,79 @@
 
 用于四波段 TIFF 的二分类语义分割，包含配置控制的结构消融、训练、按轮次断点续训、独立评估、单图/文件夹预测、曲线和预测图片导出。支持原版基线、完整改进解码器、独立 FreqFusion、MiT/ResNet-50 双编码器及高分辨率恢复、前景／背景判别分支；旧实验保留用于复现。
 
-## 输入尺度对照：512 输入、原图网格监督（当前实验）
+## 当前实验：共享 B0 的双尺度编码与 F2/F3 交互
+
+保留现有渐进解码器、可学习上采样、FreqFusion 和 CE＋0.1 前景 Lovász。
+同一张原始图先用原训练集统计归一化：一路保持256，一路双线性插值至512。
+两路调用**同一个** MiT-B0 模块、共享全部编码器参数，不复制第二套编码器。
+256路径直接使用原始归一化张量，不从512插值图再缩小。两路都参与反向传播，
+也都用于评估与预测。只运行一次现有解码器，分类 logits 恢复至原256网格后，
+再计算损失、softmax、argmax 和指标；标注与数据划分均不改变。
+
+| 配置项 | 值 | 含义 |
+| --- | --- | --- |
+| `shared_scale` | `off` / `plain` / `interaction` | 关闭 / 普通残差融合 / 学习式空间交互 |
+| `shared_scale_stages` | `[2, 3]` | 对齐并融合 F2、F3；可以只选2或3 |
+| `shared_scale_width` | `32` | 新融合分支的瓶颈宽度 |
+| `input_scale` | `2.0` | 主路径放大2倍，开启双尺度时固定此值 |
+
+两个编码器前向均完整执行，再将原尺度 F2/F3 对齐至512路径的相应特征尺寸。
+交互发生在编码器输出与解码器之间，**不会把融合后的F2再次送入MiT第3阶段**。
+F1、F4保留512主路径结果。对256原图，主路径F1/F2/F3/F4尺寸为128/64/32/16，
+原尺度路径为64/32/16/8；所有尺度均覆盖同一张图像。
+
+令 `H` 为主路径特征，`L` 为对齐后的原尺度特征：
+
+- 两组共享相同候选设计：`D = Conv1x1(Bottleneck(concat(H,L)))`。
+- `plain`：`Y = H + D`，作为普通特征融合对照。
+- `interaction`：`G = 2 * sigmoid(Gate(concat(H,L,abs(H-L))))`，`Y = H + G*D`。
+- Bottleneck含1×1投影、GN、GELU和3×3深度卷积。Gate输出逐位置单通道权重，广播至通道维。
+- Gate末层零初始化，使初始`G=1`；候选输出使用非零初始化。两组初始前向与公共权重相同，
+  原尺度分支和共享编码器从第一次更新就能收到梯度。新融合/交互参数使用解码器学习率。
+
+这是受多分辨率分割启发的监督式实验，并非HRDA原论文复现或源码移植。
+相关来源：[HRDA及TPAMI扩展](https://github.com/lhoyer/HRDA)。双尺度、门控、Lovász本身均有已有研究；
+是否有本任务的额外贡献，应与普通融合及512单分支对照检验，不能提前保证提升。
+共享权重可以控制参数增长，但两次编码仍增加计算和显存。无需新增依赖。
+
+参数量实测：已有512单分支5,601,432；普通融合5,623,992（增加22,560，约0.40%）；
+学习式交互5,646,394（增加44,962，约0.80%）。本地RTX4060上的batch8合成前向、
+CE/Lovász反向和优化器更新均通过；此检查不代表真实数据的精度提升，服务器仍应先做显存检查。
+
+两份新配置只在`shared_scale`模式上不同，其余训练设置与现有512强对照相同：
+
+| 版本 | 配置 | 输出目录 |
+| --- | --- | --- |
+| 已有512单分支 | `configs/segformer_b0_decoder_freqfusion_lovasz_scale2.yaml` | `outputs/gf16m_decoder_freqfusion_lovasz_scale2_s42` |
+| 新普通融合 | `configs/segformer_b0_decoder_freqfusion_lovasz_shared_plain.yaml` | `outputs/gf16m_decoder_freqfusion_lovasz_shared_plain_s42` |
+| 新学习式交互 | `configs/segformer_b0_decoder_freqfusion_lovasz_shared_interaction.yaml` | `outputs/gf16m_decoder_freqfusion_lovasz_shared_interaction_s42` |
+
+已有512实验不必重跑。服务器更新代码后执行（使用已有MiT-B0预训练缓存）：
+
+```bash
+cd /root/segformer
+source /etc/network_turbo
+git pull --ff-only
+bash scripts/run_shared_scale.sh
+```
+
+本地权重目录可通过 `PRETRAINED_MODEL=/root/models/mit-b0 bash scripts/run_shared_scale.sh` 指定。
+脚本先检查两种模式的256原图、512主输入、batch8的前向和反向，再依次独立训练两组100轮，
+评估val/test，导出全部验证集概率图并打包。不加载旧实验分割权重；两组分别从同一ImageNet编码器初始化。
+同一新实验中断后重跑脚本会用本组`last.pt`恢复，训练未完成不会导出成最终结果。
+导出时不覆盖已有目录；若上次评估或预测中断留下了不完整目录，先将该目录改名保留，再重跑脚本。
+已完成的`analysis_bundle.zip`会跳过；不要将其他实验结果放入这些新目录。
+
+只需下载两组各自的 **`analysis_bundle.zip`** 给我分析，包内是训练记录、val/test指标、
+数据/权重指纹和验证集概率图。无需下载原图、逐轮可视化或全部PNG对比图。
+服务器继续保留`best.pt`以供预测和复核、`last.pt`以供续训；删除实例前还需单独备份权重或保存完整系统盘镜像，
+分析ZIP不包含权重。
+
+启动后核对`model_summary.json`：MiT仍只有一套、`shared_scale_fusion`参数量大于0；
+`architecture.json`应显示对应`shared_scale`模式。检查点保存结构，评估/预测自动重建，无需另开开关。
+旧配置与旧检查点缺省`shared_scale: off`，原512和原256路径保持不变。
+
+## 输入尺度对照：512 输入、原图网格监督
 
 本轮只验证输入采样密度，不接入完整双尺度网络。参考仍为
 `configs/segformer_b0_decoder_freqfusion_lovasz.yaml`，新配置为

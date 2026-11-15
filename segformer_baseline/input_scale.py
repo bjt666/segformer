@@ -15,6 +15,19 @@ INPUT_SCALE_POLICY = (
     "before CE, Lovasz, softmax or argmax. One input scale, not multi-scale inference."
 )
 
+SHARED_SCALE_POLICY = (
+    "Normalize original selected bands using original training pixels. Feed the unchanged normalized "
+    "image to the native context path and its bilinear 2x interpolation (align_corners=False, "
+    "antialias=False, half-up dimensions) to the main path, using ONE shared MiT encoder. "
+    "Align and fuse selected context features into main features before ONE decoder. Keep masks "
+    "unchanged; resize raw logits to the original grid before CE, Lovasz, softmax or argmax. "
+    "Both paths are used during training, evaluation and prediction; no prediction ensemble."
+)
+
+
+def input_scale_policy(config: dict) -> str:
+    return SHARED_SCALE_POLICY if config.get("shared_scale", "off") != "off" else INPUT_SCALE_POLICY
+
 
 def validate_input_scale(value) -> float:
     if type(value) not in (int, float) or not math.isfinite(value) or not 0 < value <= 4:
@@ -48,13 +61,20 @@ def checkpoint_input_scale(checkpoint: dict) -> float:
 
 
 def forward_with_input_scale(model, images: torch.Tensor, **kwargs):
-    """All CLI forward paths share this function; the model itself stays intact."""
+    """Keep the original normalized tensor for the optional shared context path."""
+    architecture = getattr(getattr(model, "config", None), "local_refinement", {})
+    shared = architecture.get("shared_scale", "off") != "off"
+    context = images
     scale = model_input_scale(model)
+    if shared and (scale != 2.0 or min(images.shape[-2:]) < 32):
+        raise ValueError("Shared-scale forward requires input_scale 2.0 and native dimensions >= 32.")
     if scale != 1.0:
         size = scaled_size(images.shape[-2:], scale)
         if min(size) < 32:
             raise ValueError(f"Scaled input size {size} is too small for the four-stage MiT encoder (minimum 32).")
         images = F.interpolate(images, size=size, mode="bilinear", align_corners=False, antialias=False)
+    if shared:
+        return model(pixel_values=images, context_pixel_values=context, **kwargs)
     return model(pixel_values=images, **kwargs)
 
 

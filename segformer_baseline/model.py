@@ -15,10 +15,12 @@ from .error_refinement import ErrorRefinement, ErrorRefinementSegformer
 from .hybrid import DualEncoder, DualSegformerForSemanticSegmentation, HighResolutionFusion
 from .input_scale import checkpoint_input_scale, validate_input_scale
 from .refinement import RefinedDecodeHead
+from .shared_scale import SharedScaleFusion, SharedScaleSegformer
 from .unravel import UnravelEncoder
 
 
 ARCHITECTURE_FIELDS = (
+    "shared_scale", "shared_scale_stages", "shared_scale_width",
     "module_a", "module_b", "local_kernels", "refinement_stages", "gate_mode",
     "gate_reduction", "gate_init_probability", "residual_init_std",
     "decoder_fusion", "decoder_upsampling", "upsample_channels",
@@ -43,11 +45,14 @@ def architecture_from_config(config: dict) -> dict:
     architecture = {key: copy.deepcopy(config.get(key, DEFAULTS[key])) for key in ARCHITECTURE_FIELDS}
     validation = default_config()
     validation.update(architecture)
+    if architecture["shared_scale"] != "off":
+        validation["input_scale"] = 2.0
     if architecture["spectral_refinement"] != "off":
         validation["input_channels"] = config.get("input_channels", validation["input_channels"])
     validate_config(validation)
     # Stage order does not change the computation or state-dict layout.
     architecture["refinement_stages"] = sorted(architecture["refinement_stages"])
+    architecture["shared_scale_stages"] = sorted(architecture["shared_scale_stages"])
     return architecture
 
 
@@ -127,6 +132,7 @@ def model_parameter_counts(model) -> dict:
             "high_resolution_branch": highres, "high_resolution_fusion": highres_fusion,
             "encoder_discrimination": discrimination,
             "encoder_unravel": unravel,
+            "shared_scale_fusion": count(model.shared_scale_fusion) if hasattr(model, "shared_scale_fusion") else 0,
             "error_refinement": count(model.error_refinement) if hasattr(model, "error_refinement") else 0,
             "decoder": decoder, "original_decoder": original_decoder,
             "refinement": refinement, "decoder_redesign": redesign, "freqfusion": freqfusion,
@@ -148,6 +154,8 @@ def optimizer_parameter_groups(model, config: dict) -> list[dict]:
         new_parameters.extend(model.segformer.encoder.new_parameters())
     if hasattr(model, "error_refinement"):
         new_parameters.extend(model.error_refinement.parameters())
+    if hasattr(model, "shared_scale_fusion"):
+        new_parameters.extend(model.shared_scale_fusion.parameters())
     new_ids = {id(parameter) for parameter in new_parameters}
     backbone = [parameter for parameter in model.segformer.parameters() if id(parameter) not in new_ids]
     decoder_and_branch = list(model.decode_head.parameters()) + new_parameters
@@ -167,6 +175,8 @@ def _attach_architecture(model, architecture: dict) -> None:
     # Retain the schema-2 metadata key so old A/B checkpoints remain readable.
     # It now describes optional encoder, decoder and refinement switches.
     model.config.local_refinement = copy.deepcopy(architecture)
+    if architecture["shared_scale"] != "off" and getattr(model.config, "input_scale", 1.0) != 2.0:
+        raise ValueError("Shared-scale models require input_scale: 2.0.")
     if _uses_custom_decoder(architecture):
         with torch.random.fork_rng(devices=[]):
             model.decode_head = DecoderHead(model.decode_head, model.config, architecture)
@@ -198,10 +208,16 @@ def _attach_architecture(model, architecture: dict) -> None:
                 model.config.hidden_sizes, architecture["error_refinement_channels"],
                 architecture["error_refinement_mode"], architecture["error_max_correction"],
             )
+    if architecture["shared_scale"] != "off":
+        if not model.config.reshape_last_stage:
+            raise ValueError("Shared-scale fusion requires four spatial encoder features.")
+        with torch.random.fork_rng(devices=[]):
+            model.shared_scale_fusion = SharedScaleFusion(model.config.hidden_sizes, architecture)
 
 
 def _new_model(model_config: SegformerConfig, architecture: dict) -> SegformerForSemanticSegmentation:
-    model_class = (ErrorRefinementSegformer if architecture["error_refinement"]
+    model_class = (SharedScaleSegformer if architecture["shared_scale"] != "off"
+                   else ErrorRefinementSegformer if architecture["error_refinement"]
                    else DualSegformerForSemanticSegmentation if architecture["dual_encoder"]
                    else DiscriminationSegformerForSemanticSegmentation if architecture["encoder_discrimination"]
                    else DecoderSegformerForSemanticSegmentation if _uses_custom_decoder(architecture)
